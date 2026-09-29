@@ -11,6 +11,7 @@ export function parseBox(source: string): BoxDef {
 
 class Parser {
   private pos = 0;
+  private loopDepth = 0;
 
   constructor(private readonly tokens: Token[]) {}
 
@@ -64,10 +65,10 @@ class Parser {
 
   private parseStatement(): Stmt {
     if (this.isKeyword('if')) return this.parseIf();
+    if (this.isKeyword('for')) return this.parseFor();
     const tok = this.peek();
-    if (this.isKeyword('for')) throw this.error(lockedMessage('laco'), tok);
     if (this.isKeyword('match')) throw this.error(lockedMessage('casamento'), tok);
-    if (this.isKeyword('while')) throw this.error('"while" é proibido: use "for" sobre coleções finitas', tok);
+    if (this.isKeyword('while')) throw this.error('"while" é proibido: use "for" sobre uma lista ou range()', tok);
     if (this.isKeyword('elif') || this.isKeyword('else')) throw this.error(`"${tok.value}" sem "if" antes`, tok);
     if (this.peek().type === 'indent') throw this.error('indentação inesperada', tok);
     const stmt = this.parseSimpleStatement();
@@ -87,13 +88,20 @@ class Parser {
       this.advance();
       return { kind: 'pass', ...pos };
     }
+    if (this.isKeyword('break') || this.isKeyword('continue')) {
+      const word = this.advance().value as 'break' | 'continue';
+      if (this.loopDepth === 0) throw this.error(`"${word}" só pode ser usado dentro de um "for"`, tok);
+      return { kind: word, ...pos };
+    }
     if (this.isKeyword('let') || this.isKeyword('const')) {
       const mutable = this.advance().value === 'let';
       const name = this.expectName('nome da variável').value;
       this.expectOp('=');
       return { kind: 'declare', mutable, name, value: this.parseExpression(), ...pos };
     }
-    if (this.isKeyword('if')) throw this.error('"if" precisa começar em uma linha própria', tok);
+    if (this.isKeyword('if') || this.isKeyword('for')) {
+      throw this.error(`"${tok.value}" precisa começar em uma linha própria`, tok);
+    }
     if (tok.type === 'name' && this.peekAt(1).type === 'op' && this.peekAt(1).value === '=') {
       this.advance();
       this.advance();
@@ -123,6 +131,21 @@ class Parser {
       orElse = this.parseBlock();
     }
     return { kind: 'if', branches, orElse, line: start.line, col: start.col };
+  }
+
+  private parseFor(): Stmt {
+    const start = this.advance();
+    const name = this.expectName('nome da variável do laço').value;
+    if (!this.isKeyword('in')) throw this.error('esperado "in" depois da variável do laço', this.peek());
+    this.advance();
+    const iterable = this.parseExpression();
+    this.expectOp(':');
+    this.loopDepth++;
+    try {
+      return { kind: 'for', name, iterable, body: this.parseBlock(), line: start.line, col: start.col };
+    } finally {
+      this.loopDepth--;
+    }
   }
 
   // ---- Expressões, da menor para a maior precedência ----
@@ -222,11 +245,15 @@ class Parser {
         const property = this.expectName('nome do campo').value;
         expr = { kind: 'member', object: expr, property, line: tok.line, col: tok.col };
       } else if (this.matchOp('[')) {
-        if (this.isOp(':')) throw this.error(`fatiamento: ${lockedMessage('historico')}`, this.peek());
-        const index = this.parseExpression();
-        if (this.isOp(':')) throw this.error(`fatiamento: ${lockedMessage('historico')}`, this.peek());
-        this.expectOp(']');
-        expr = { kind: 'index', object: expr, index, line: tok.line, col: tok.col };
+        const start = this.isOp(':') ? null : this.parseExpression();
+        if (this.matchOp(':')) {
+          const end = this.isOp(']') ? null : this.parseExpression();
+          this.expectOp(']');
+          expr = { kind: 'slice', object: expr, start, end, line: tok.line, col: tok.col };
+        } else {
+          this.expectOp(']');
+          expr = { kind: 'index', object: expr, index: start!, line: tok.line, col: tok.col };
+        }
       } else {
         return expr;
       }

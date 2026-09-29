@@ -11,9 +11,10 @@ export interface Token {
 
 const KEYWORDS = new Set([
   'box', 'if', 'elif', 'else', 'return', 'let', 'const', 'pass',
+  'for', 'in', 'break', 'continue',
   'and', 'or', 'not', 'True', 'False', 'None',
   // Reservadas: existem na linguagem, mas estão bloqueadas ou proibidas.
-  'for', 'in', 'while', 'match', 'case', 'def', 'import',
+  'while', 'match', 'case', 'def', 'import',
 ]);
 
 // Ordem importa: operadores mais longos primeiro.

@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Relé: um jogo por turnos de padrões ocultos e automação por scripts." />
+    <meta name="description" content="Relé: um jogo por turnos de padrões ocultos, relés e automação por scripts." />
     <title>Relé</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23070b10'/%3E%3Cpath d='M5 16h9v-7h13M14 16v7h13' stroke='%2360a5fa' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='14' cy='16' r='3' fill='%23c084fc'/%3E%3C/svg%3E" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -40,59 +40,43 @@
       </header>
 
       <main class="layout">
-        <section class="col-left">
-          <div class="panel board-panel" aria-label="Tabuleiro">
-            <div class="board-head">
-              <span class="label">Próximos</span>
-              <ol class="queue" id="queue"></ol>
-            </div>
-            <div class="canvas-wrap"><canvas id="board" aria-label="Grade de fios com os pulsos"></canvas></div>
-            <div class="turn-bar">
-              <div class="meter">
-                <span class="label">Ações</span>
-                <span class="pips" id="actions"></span>
-              </div>
-              <div class="meter energy">
-                <span class="label">Energia</span>
-                <span class="bar"><span id="energy-fill"></span></span>
-                <span class="value" id="energy-value">60</span>
-              </div>
-              <p class="hint" id="hint" aria-live="polite"></p>
-              <button type="button" class="primary end" id="btn-end">Encerrar turno <kbd>Espaço</kbd></button>
-            </div>
+        <section class="panel board-panel" aria-label="Tabuleiro">
+          <div class="board-head">
+            <span class="label">Próximos</span>
+            <ol class="queue" id="queue"></ol>
+            <span class="board-stats" id="board-stats"></span>
           </div>
-
-          <div class="panel timeline-panel" aria-label="Linha do tempo dos sinais">
-            <div class="panel-head">
-              <h2>Sinais <span class="sub">por seq, uma linha por porta</span></h2>
-              <div class="seg" role="group" aria-label="Agrupar por resto da divisão de seq">
-                <span class="label">agrupar</span>
-                <button type="button" data-group="" aria-pressed="true">não</button>
-                <button type="button" data-group="2" aria-pressed="false">%2</button>
-                <button type="button" data-group="3" aria-pressed="false">%3</button>
-                <button type="button" data-group="4" aria-pressed="false">%4</button>
-              </div>
+          <div class="canvas-wrap"><canvas id="board" aria-label="Grade de fios, relés e pulsos"></canvas></div>
+          <div class="turn-bar">
+            <div class="meter">
+              <span class="label">Ações</span>
+              <span class="pips" id="actions"></span>
             </div>
-            <div class="timeline" id="timeline"></div>
-            <p class="legend">
-              <span><i class="lg-dot"></i>cor conhecida</span>
-              <span><i class="lg-ring"></i>chegou velado</span>
-              <span><i class="lg-q">?</i>desconhecida</span>
-              <span><i class="lg-bar good"></i>acerto <i class="lg-bar bad"></i>erro <i class="lg-bar lost"></i>perdido</span>
-            </p>
+            <div class="meter energy">
+              <span class="label">Energia</span>
+              <span class="bar"><span id="energy-fill"></span></span>
+              <span class="value" id="energy-value">0</span>
+            </div>
+            <p class="hint" id="hint" aria-live="polite"></p>
+            <button type="button" id="btn-hold" title="Segurar o pulso selecionado por 1 turno (S)">Segurar <kbd>S</kbd></button>
+            <button type="button" class="primary end" id="btn-end">Encerrar turno <kbd>Espaço</kbd></button>
           </div>
         </section>
 
-        <section class="panel code-panel" aria-label="Classificador">
-          <div class="panel-head">
-            <h2>Classificador <code>classificar(p, hist)</code></h2>
-            <span class="status" id="script-status"></span>
+        <section class="panel code-panel" aria-label="Scripts">
+          <div class="box-tabs" role="tablist" aria-label="Caixas">
+            <button type="button" role="tab" id="box-classificar" aria-selected="true">
+              Classificador <code>classificar(p, hist)</code><span class="status" id="status-classificar"></span>
+            </button>
+            <button type="button" role="tab" id="box-rotear" aria-selected="false">
+              Roteador <code>rotear(j, p, destino)</code><span class="status" id="status-rotear"></span>
+            </button>
           </div>
           <div class="editor">
             <pre class="gutter" id="gutter" aria-hidden="true"></pre>
             <div class="code-area">
               <pre class="highlight" id="highlight" aria-hidden="true"></pre>
-              <textarea id="editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Código do Classificador"></textarea>
+              <textarea id="editor" spellcheck="false" autocomplete="off" autocapitalize="off" aria-label="Código da caixa"></textarea>
               <ul class="completions" id="completions" role="listbox" hidden></ul>
             </div>
           </div>
@@ -105,45 +89,83 @@
           </div>
 
           <div class="tabs" role="tablist">
-            <button type="button" role="tab" id="tab-log" aria-selected="true" aria-controls="panel-log">Registro</button>
+            <button type="button" role="tab" id="tab-signals" aria-selected="true" aria-controls="panel-signals">Sinais</button>
+            <button type="button" role="tab" id="tab-log" aria-selected="false" aria-controls="panel-log">Registro</button>
             <button type="button" role="tab" id="tab-bench" aria-selected="false" aria-controls="panel-bench">Bancada</button>
             <button type="button" role="tab" id="tab-ref" aria-selected="false" aria-controls="panel-ref">Referência</button>
           </div>
-          <div class="tab-body" role="tabpanel" id="panel-log" aria-labelledby="tab-log">
+          <div class="tab-body" role="tabpanel" id="panel-signals" aria-labelledby="tab-signals">
+            <div class="signals-controls">
+              <div class="seg" role="group" aria-label="Linhas da linha do tempo">
+                <span class="label">linhas</span>
+                <button type="button" data-rows="porta" aria-pressed="true">porta</button>
+                <button type="button" data-rows="carga" aria-pressed="false">carga</button>
+                <button type="button" data-rows="forma" aria-pressed="false">forma</button>
+              </div>
+              <div class="seg" role="group" aria-label="Agrupar por resto da divisão de seq">
+                <span class="label">agrupar</span>
+                <button type="button" data-group="" aria-pressed="true">não</button>
+                <button type="button" data-group="2" aria-pressed="false">%2</button>
+                <button type="button" data-group="3" aria-pressed="false">%3</button>
+                <button type="button" data-group="4" aria-pressed="false">%4</button>
+                <button type="button" data-group="5" aria-pressed="false">%5</button>
+              </div>
+            </div>
+            <div class="timeline" id="timeline"></div>
+            <p class="legend">
+              <span><i class="lg-q">?</i>cor desconhecida</span>
+              <span><i class="lg-ring"></i>chegou velado</span>
+              <span>● ■ ▶ forma · pontinhos = carga</span>
+              <span><i class="lg-bar good"></i>acerto <i class="lg-bar bad"></i>erro <i class="lg-bar lost"></i>perdido</span>
+            </p>
+          </div>
+          <div class="tab-body" role="tabpanel" id="panel-log" aria-labelledby="tab-log" hidden>
             <ol class="log" id="log"></ol>
           </div>
           <div class="tab-body" role="tabpanel" id="panel-bench" aria-labelledby="tab-bench" hidden>
             <div class="bench" id="bench">
-              <p class="empty">Clique em <b>Testar</b> para rodar o script contra os últimos pulsos entregues, com o véu original.</p>
+              <p class="empty">Clique em <b>Testar</b>. No Classificador, o script roda contra os últimos pulsos que saíram, com o véu original. No Roteador, simula uma rota de cada porta ativa para cada saída ativa.</p>
             </div>
           </div>
           <div class="tab-body reference" role="tabpanel" id="panel-ref" aria-labelledby="tab-ref" hidden>
             <div class="ref-grid">
               <div>
-                <h3>O pulso <code>p</code></h3>
+                <h3>Pulso <code>p</code></h3>
                 <ul>
                   <li><code>p.cor</code> Cor, ou <code>None</code> se velado</li>
-                  <li><code>p.porta</code> 1, 2 ou 3</li>
-                  <li><code>p.seq</code> nº de sequência do pulso</li>
-                  <li><code>p.turno</code> turno em que entrou</li>
+                  <li><code>p.porta</code> 1–10 · <code>p.seq</code> nº de sequência · <code>p.turno</code></li>
+                  <li><code>p.carga</code> 1, 2 ou 3 · <code>p.forma</code> <code>CIRCULO</code> <code>QUADRADO</code> <code>TRIANGULO</code></li>
+                  <li><code>hist</code> os 10 pulsos anteriores (<code>hist[-1]</code> é o último)</li>
+                </ul>
+                <h3>Relé <code>j</code> e <code>destino</code></h3>
+                <ul>
+                  <li><code>j.linha</code> <code>j.coluna</code> <code>j.direcao</code></li>
+                  <li><code>j.norte</code> <code>j.leste</code> <code>j.sul</code> True se o fio está livre</li>
+                  <li><code>p.direcao</code> para onde o pulso vinha andando (só no Roteador)</li>
+                  <li><code>destino.linha</code> <code>destino.cor</code> <code>destino.terra</code> (ou <code>None</code>)</li>
+                  <li><code>ocupado(j, DIR)</code> a próxima casa vai estar ocupada?</li>
                 </ul>
                 <h3>Retornos</h3>
-                <p><code>saida(COR)</code> <code>TERRA</code> <code>MANUAL</code></p>
-                <h3>Cores</h3>
-                <p><code class="c-RED">RED</code> <code class="c-GREEN">GREEN</code> <code class="c-BLUE">BLUE</code> <code class="c-YELLOW">YELLOW</code> <code class="c-GRAY">GRAY</code></p>
+                <p>Classificador: <code>saida(COR)</code> <code>TERRA</code> <code>MANUAL</code><br />Roteador: <code>NORTE</code> <code>LESTE</code> <code>SUL</code> <code>ESPERAR</code> <code>MANTER</code></p>
               </div>
               <div>
                 <h3>Sintaxe</h3>
                 <ul>
-                  <li><code>if</code> <code>elif</code> <code>else</code> <code>return</code> <code>pass</code></li>
-                  <li><code>let</code> variável, <code>const</code> constante</li>
-                  <li><code>and</code> <code>or</code> <code>not</code> <code>??</code> <code>==</code> <code>!=</code> <code>&lt;</code> <code>&gt;</code></li>
-                  <li><code>+ - * // %</code>, listas <code>[A, B]</code>, <code>lista[i]</code>, <code>len()</code></li>
+                  <li><code>if</code> <code>elif</code> <code>else</code> <code>for x in lista:</code> <code>break</code> <code>continue</code></li>
+                  <li><code>let</code> <code>const</code> <code>return</code> <code>pass</code></li>
+                  <li><code>and</code> <code>or</code> <code>not</code> <code>??</code> <code>==</code> <code>!=</code> <code>&lt;</code> <code>&gt;</code> <code>+ - * // %</code></li>
+                  <li>listas <code>[A, B]</code>, <code>l[i]</code>, <code>l[a:b]</code>, <code>len()</code>, <code>range(n)</code></li>
+                </ul>
+                <h3>Regras do movimento</h3>
+                <ul>
+                  <li>O pulso segue a seta do relé; o Roteador decide a seta quando há pulso nele.</li>
+                  <li>Mais antigos decidem primeiro. Casa com pulso parado: fila. Dois entrando na mesma casa: colisão (−1 cada). No barramento vertical, pulsos em sentidos opostos se cruzam.</li>
+                  <li>Sem destino na 2ª coluna de relés: terra. 60 turnos na grade: queima.</li>
                 </ul>
                 <h3>Limites</h3>
                 <ul>
-                  <li>50 operações por chamada · 60 de energia por turno · chip: 1/turno</li>
-                  <li>Bloqueados: <code>hist</code> 40 PP · <code>for</code> 60 PP · <code>=&gt;</code> 100 PP · <code>match</code> 120 PP</li>
+                  <li>120 operações por chamada · 1000 de energia por turno · cada caixa instalada: 1/turno</li>
+                  <li>Bloqueados: <code>=&gt;</code> 100 PP · <code>match</code> 120 PP</li>
                 </ul>
               </div>
             </div>

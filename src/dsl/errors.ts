@@ -12,8 +12,6 @@ export class DslError extends Error {
 
 /** Recursos da linguagem que existem no design mas ainda não foram desbloqueados. */
 export const LOCKED_FEATURES = {
-  historico: { nome: 'Histórico', preco: 40 },
-  laco: { nome: 'Laço', preco: 60 },
   funcional: { nome: 'Funcional', preco: 100 },
   casamento: { nome: 'Casamento', preco: 120 },
 } as const;

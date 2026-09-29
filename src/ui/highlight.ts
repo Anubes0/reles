@@ -5,12 +5,17 @@ import { COLORS } from '../core/colors';
  * precisa colorir código incompleto enquanto o jogador digita.
  */
 
-export const KEYWORDS = ['box', 'if', 'elif', 'else', 'return', 'let', 'const', 'pass', 'and', 'or', 'not'];
-export const LOCKED_WORDS = ['for', 'in', 'while', 'match', 'case', 'def', 'import'];
+export const KEYWORDS = ['box', 'if', 'elif', 'else', 'for', 'in', 'break', 'continue', 'return', 'let', 'const', 'pass', 'and', 'or', 'not'];
+export const LOCKED_WORDS = ['while', 'match', 'case', 'def', 'import'];
 export const CONSTANTS = ['TERRA', 'MANUAL', 'None', 'True', 'False'];
-export const BUILTINS = ['saida', 'len'];
-export const PULSE_FIELDS = ['cor', 'porta', 'seq', 'turno'];
-const COLOR_NAMES: readonly string[] = [...COLORS, 'GRAY'];
+export const DIRECTIONS = ['NORTE', 'LESTE', 'SUL', 'ESPERAR', 'MANTER'];
+export const SHAPE_WORDS = ['CIRCULO', 'QUADRADO', 'TRIANGULO'];
+export const BUILTINS = ['saida', 'len', 'range', 'ocupado'];
+export const COLOR_WORDS: readonly string[] = [...COLORS, 'GRAY'];
+
+export const PULSE_FIELDS = ['cor', 'porta', 'seq', 'turno', 'carga', 'forma'];
+export const RELAY_FIELDS = ['linha', 'coluna', 'norte', 'leste', 'sul', 'direcao'];
+export const DEST_FIELDS = ['linha', 'cor', 'terra'];
 
 export interface Span {
   text: string;
@@ -39,9 +44,9 @@ function wordClass(word: string, afterDot: boolean): string {
   if (afterDot) return 'c-field';
   if (KEYWORDS.includes(word)) return 'c-kw';
   if (LOCKED_WORDS.includes(word)) return 'c-locked';
-  // `hist` faz parte da assinatura; só está bloqueado para uso.
-  if (word === 'hist') return 'c-dormant';
-  if (COLOR_NAMES.includes(word)) return `c-color c-${word}`;
+  if (COLOR_WORDS.includes(word)) return `c-color c-${word}`;
+  if (DIRECTIONS.includes(word)) return 'c-dir';
+  if (SHAPE_WORDS.includes(word)) return 'c-shape';
   if (CONSTANTS.includes(word)) return 'c-const';
   if (BUILTINS.includes(word)) return 'c-fn';
   return 'c-ident';

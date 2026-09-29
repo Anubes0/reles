@@ -1,29 +1,52 @@
-import { compileClassifier } from '../game/classifier';
+import { compileFor, SIGNATURES, type BoxId } from '../game/boxes';
 import { el } from './dom';
-import { BUILTINS, CONSTANTS, highlightLine, KEYWORDS, PULSE_FIELDS } from './highlight';
+import {
+  BUILTINS,
+  COLOR_WORDS,
+  CONSTANTS,
+  DEST_FIELDS,
+  DIRECTIONS,
+  highlightLine,
+  KEYWORDS,
+  PULSE_FIELDS,
+  RELAY_FIELDS,
+  SHAPE_WORDS,
+} from './highlight';
 
 const INDENT = '    ';
-const MAX_COMPLETIONS = 7;
+const MAX_COMPLETIONS = 8;
 
 const DETAILS: Record<string, string> = {
   cor: 'Cor, ou None se velado',
-  porta: '1, 2 ou 3',
+  porta: 'porta de entrada (1–10)',
   seq: 'nº de sequência do pulso',
   turno: 'turno em que entrou',
+  carga: '1, 2 ou 3',
+  forma: 'CIRCULO, QUADRADO ou TRIANGULO',
+  linha: 'linha (0 = topo)',
+  coluna: 'coluna do relé',
+  norte: 'True se dá para ir ao norte',
+  leste: 'True se dá para ir ao leste',
+  sul: 'True se dá para ir ao sul',
+  direcao: 'NORTE, LESTE ou SUL',
+  terra: 'True se o destino é o terra',
   saida: 'saida(COR) → destino',
   len: 'len(lista) → tamanho',
+  range: 'range(n) → [0, …, n−1]',
+  ocupado: 'ocupado(j, DIR) → a casa vai estar ocupada?',
   TERRA: 'destino: terra',
   MANUAL: 'deixa o pulso para você',
   None: 'ausência de valor',
-  RED: 'cor',
-  GREEN: 'cor',
-  BLUE: 'cor',
-  YELLOW: 'cor',
+  NORTE: 'direção',
+  LESTE: 'direção',
+  SUL: 'direção',
+  ESPERAR: 'o pulso fica parado 1 turno',
+  MANTER: 'o relé fica como está',
   GRAY: 'cor do ruído',
   let: 'variável',
   const: 'constante',
+  for: 'for x in lista:',
 };
-const COLOR_WORDS = ['RED', 'GREEN', 'BLUE', 'YELLOW', 'GRAY'];
 
 export interface EditorElements {
   textarea: HTMLTextAreaElement;
@@ -50,6 +73,7 @@ interface Completion {
  * numeração de linhas, erro marcado no ponto exato, indentação por Tab e autocompletar.
  */
 export class CodeEditor {
+  box: BoxId = 'classificar';
   private validateTimer = 0;
   private error: { line: number; col: number } | null = null;
   private completions: Completion[] = [];
@@ -74,8 +98,12 @@ export class CodeEditor {
     return this.els.textarea.value;
   }
 
-  set value(source: string) {
+  /** Troca o conteúdo (ao abrir outra caixa, por exemplo) e valida na hora. */
+  load(box: BoxId, source: string): void {
+    this.box = box;
     this.els.textarea.value = source;
+    this.els.textarea.scrollTop = 0;
+    this.closeCompletions();
     this.validate();
   }
 
@@ -101,7 +129,7 @@ export class CodeEditor {
   }
 
   private validate(): void {
-    const result = compileClassifier(this.value);
+    const result = compileFor(this.box, this.value);
     if (result.ok) {
       this.error = null;
       this.els.message.className = 'editor-msg ok';
@@ -257,11 +285,12 @@ export class CodeEditor {
     const lineBefore = before.slice(before.lastIndexOf('\n') + 1);
     if (lineBefore.includes('#')) return this.closeCompletions();
 
-    const member = /([A-Za-z_]\w*)\.$/.exec(before.slice(0, start));
     let candidates: Completion[];
-    if (member) {
-      if (member[1] !== this.pulseParam()) return this.closeCompletions();
-      candidates = PULSE_FIELDS.map((f) => ({ label: f, insert: f, detail: DETAILS[f] ?? '' }));
+    const beforeDot = before.slice(0, start);
+    if (beforeDot.endsWith('.')) {
+      const fields = this.fieldsFor(beforeDot.slice(0, -1));
+      if (!fields) return this.closeCompletions();
+      candidates = fields.map((f) => ({ label: f, insert: f, detail: DETAILS[f] ?? '' }));
     } else {
       if (prefix.length === 0 && !force) return this.closeCompletions();
       candidates = this.vocabulary();
@@ -277,23 +306,48 @@ export class CodeEditor {
     this.renderCompletions();
   }
 
-  private pulseParam(): string {
-    return /box\s+\w+\s*\(\s*([A-Za-z_]\w*)/.exec(this.value)?.[1] ?? 'p';
+  private params(): string[] {
+    const declared = /box\s+\w+\s*\(([^)]*)\)/.exec(this.value)?.[1];
+    const names = declared?.split(',').map((p) => p.trim()).filter(Boolean);
+    return names?.length ? names : SIGNATURES[this.box].params;
   }
 
-  /** Palavras da linguagem mais as variáveis e parâmetros que o jogador declarou. */
-  private vocabulary(): Completion[] {
-    const declared = new Set<string>();
-    for (const m of this.value.matchAll(/\b(?:let|const)\s+([A-Za-z_]\w*)/g)) declared.add(m[1]);
-    const params = /box\s+\w+\s*\(([^)]*)\)/.exec(this.value)?.[1] ?? '';
-    for (const p of params.split(',')) if (p.trim()) declared.add(p.trim());
+  /** Campos do objeto antes do ponto: parâmetros da caixa, `hist[i]` e variáveis de laço sobre `hist`. */
+  private fieldsFor(objectText: string): string[] | null {
+    const params = this.params();
+    const byParam: Record<BoxId, (string[] | null)[]> = {
+      classificar: [PULSE_FIELDS, null],
+      rotear: [RELAY_FIELDS, [...PULSE_FIELDS, 'direcao'], DEST_FIELDS],
+    };
+    const name = /([A-Za-z_]\w*)$/.exec(objectText)?.[1];
+    if (name) {
+      const index = params.indexOf(name);
+      if (index !== -1) return byParam[this.box][index] ?? null;
+      const hist = this.box === 'classificar' ? params[1] : null;
+      if (hist && new RegExp(`for\\s+${name}\\s+in\\s+${hist}\\b`).test(this.value)) return PULSE_FIELDS;
+      return null;
+    }
+    const hist = this.box === 'classificar' ? params[1] : null;
+    if (hist && new RegExp(`\\b${hist}\\s*\\[[^\\]]*\\]$`).test(objectText)) return PULSE_FIELDS;
+    return null;
+  }
 
+  /** Palavras da linguagem desta caixa mais as variáveis e parâmetros do jogador. */
+  private vocabulary(): Completion[] {
+    const declared = new Set<string>(this.params());
+    for (const m of this.value.matchAll(/\b(?:let|const)\s+([A-Za-z_]\w*)/g)) declared.add(m[1]);
+    for (const m of this.value.matchAll(/\bfor\s+([A-Za-z_]\w*)\s+in\b/g)) declared.add(m[1]);
+
+    const router = this.box === 'rotear';
     const word = (label: string, detail = DETAILS[label] ?? '') => ({ label, insert: label, detail });
+    const builtins = BUILTINS.filter((b) => (router ? b !== 'saida' : b !== 'ocupado'));
     return [
       ...KEYWORDS.map((k) => word(k, DETAILS[k] ?? 'palavra-chave')),
-      ...COLOR_WORDS.map((c) => word(c)),
-      ...CONSTANTS.map((c) => word(c, DETAILS[c] ?? 'constante')),
-      ...BUILTINS.map((b) => ({ label: b, insert: `${b}(`, detail: DETAILS[b] ?? '' })),
+      ...(router ? DIRECTIONS.map((d) => word(d)) : []),
+      ...COLOR_WORDS.map((c) => word(c, DETAILS[c] ?? 'cor')),
+      ...SHAPE_WORDS.map((s) => word(s, 'forma')),
+      ...CONSTANTS.filter((c) => router ? !['TERRA', 'MANUAL'].includes(c) : true).map((c) => word(c, DETAILS[c] ?? 'constante')),
+      ...builtins.map((b) => ({ label: b, insert: `${b}(`, detail: DETAILS[b] ?? '' })),
       ...[...declared].map((d) => word(d, 'sua variável')),
     ];
   }

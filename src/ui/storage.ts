@@ -1,3 +1,4 @@
+import type { BoxId } from '../game/boxes';
 import type { ModeId } from '../game/mode';
 
 /** Acesso ao localStorage que nunca quebra o jogo (aba privada, armazenamento bloqueado etc.). */
@@ -26,6 +27,8 @@ export interface MatchRecord {
   date: string;
 }
 
+export type Baggage = Partial<Record<BoxId, string>>;
+
 const HISTORY_KEPT = 20;
 
 export const storage = {
@@ -50,28 +53,33 @@ export const storage = {
     return false;
   },
 
-  script(): string | null {
+  /** Rascunho do editor de uma caixa (a versão antiga guardava só o Classificador). */
+  script(box: BoxId): string | null {
+    const saved = read<string | null>(`reles.script.${box}`, null);
+    if (saved !== null || box !== 'classificar') return saved;
     return read<string | null>('reles.script', null);
   },
 
-  saveScript(source: string): void {
-    write('reles.script', source);
+  saveScript(box: BoxId, source: string): void {
+    write(`reles.script.${box}`, source);
   },
 
-  /** Bagagem de funções do modo: o script instalado ao fim da partida segue para a próxima. */
-  baggage(mode: ModeId): string | null {
-    return read<string | null>(`reles.bagagem.${mode}`, null);
+  /** Bagagem do modo: os scripts instalados ao fim da partida seguem para a próxima. */
+  baggage(mode: ModeId): Baggage {
+    const saved = read<Baggage | string | null>(`reles.bagagem.${mode}`, null);
+    if (typeof saved === 'string') return { classificar: saved };
+    return saved ?? {};
   },
 
-  saveBaggage(mode: ModeId, source: string | null): void {
-    write(`reles.bagagem.${mode}`, source);
+  saveBaggage(mode: ModeId, baggage: Baggage): void {
+    write(`reles.bagagem.${mode}`, baggage);
   },
 
   helpSeen(): boolean {
-    return read('reles.ajudaVista', false);
+    return read('reles.ajudaVista2', false);
   },
 
   markHelpSeen(): void {
-    write('reles.ajudaVista', true);
+    write('reles.ajudaVista2', true);
   },
 };

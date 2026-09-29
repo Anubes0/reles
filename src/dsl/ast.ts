@@ -13,7 +13,8 @@ export type Expr =
   | ({ kind: 'binary'; op: BinaryOp; left: Expr; right: Expr } & Pos)
   | ({ kind: 'call'; callee: Expr; args: Expr[] } & Pos)
   | ({ kind: 'member'; object: Expr; property: string } & Pos)
-  | ({ kind: 'index'; object: Expr; index: Expr } & Pos);
+  | ({ kind: 'index'; object: Expr; index: Expr } & Pos)
+  | ({ kind: 'slice'; object: Expr; start: Expr | null; end: Expr | null } & Pos);
 
 export type BinaryOp =
   | '+' | '-' | '*' | '//' | '%'
@@ -24,6 +25,9 @@ export type Stmt =
   | ({ kind: 'declare'; mutable: boolean; name: string; value: Expr } & Pos)
   | ({ kind: 'assign'; name: string; value: Expr } & Pos)
   | ({ kind: 'if'; branches: { test: Expr; body: Stmt[] }[]; orElse: Stmt[] | null } & Pos)
+  | ({ kind: 'for'; name: string; iterable: Expr; body: Stmt[] } & Pos)
+  | ({ kind: 'break' } & Pos)
+  | ({ kind: 'continue' } & Pos)
   | ({ kind: 'return'; value: Expr } & Pos)
   | ({ kind: 'pass' } & Pos);
 

@@ -1,11 +1,13 @@
-import { COLORS } from '../core/colors';
+import { COLORS, SHAPES } from '../core/colors';
 import type { BoxDef, Expr, Pos, Stmt } from './ast';
-import { DslError, lockedMessage } from './errors';
+import { DslError } from './errors';
 import { parseBox } from './parser';
 import {
   color,
+  dir,
   isTruthy,
   MANUAL,
+  shape,
   TERRA,
   typeName,
   valuesEqual,
@@ -14,11 +16,17 @@ import {
 } from './values';
 
 /** Teto de operações por chamada de caixa (documento conceitual: "Freios à automação"). */
-export const MAX_OPS_PER_CALL = 50;
+export const MAX_OPS_PER_CALL = 120;
+const MAX_RANGE = 100;
+
+/** Função fornecida pelo jogo para uma caixa específica (ex.: `ocupado` no Roteador). */
+export type HostFunction = (args: Value[], at: Pos) => Value;
 
 export interface BoxSignature {
   name: string;
   params: string[];
+  /** Funções do jogo disponíveis só nesta caixa. */
+  host?: string[];
 }
 
 export type CompileResult = { ok: true; box: BoxDef } | { ok: false; error: DslError };
@@ -27,13 +35,25 @@ export type RunResult =
   | { ok: true; value: Value; ops: number }
   | { ok: false; error: DslError; ops: number; limitHit: boolean };
 
+const BUILTINS = ['saida', 'len', 'range'];
+
 const GLOBALS: Record<string, Value> = {
   ...Object.fromEntries([...COLORS, 'GRAY' as const].map((c) => [c, color(c)])),
+  ...Object.fromEntries(SHAPES.map((f) => [f, shape(f)])),
+  NORTE: dir('NORTE'),
+  LESTE: dir('LESTE'),
+  SUL: dir('SUL'),
+  ESPERAR: dir('ESPERAR'),
+  MANTER: dir('MANTER'),
   TERRA,
   MANUAL,
-  saida: { t: 'funcao', name: 'saida' },
-  len: { t: 'funcao', name: 'len' },
+  ...Object.fromEntries(BUILTINS.map((name) => [name, { t: 'funcao', name } as BuiltinValue])),
 };
+
+/** Nomes que o jogador não pode usar para variáveis. */
+export function isReservedName(name: string): boolean {
+  return name in GLOBALS;
+}
 
 /** Compila o script e confere se ele respeita a assinatura fixa da caixa. */
 export function compileBox(source: string, signature: BoxSignature): CompileResult {
@@ -47,7 +67,9 @@ export function compileBox(source: string, signature: BoxSignature): CompileResu
       throw new DslError(`a assinatura é fixa: ${expected}`, box.line, box.col);
     }
     for (const param of box.params) {
-      if (param in GLOBALS) throw new DslError(`"${param}" é um nome reservado`, box.line, box.col);
+      if (param in GLOBALS || signature.host?.includes(param)) {
+        throw new DslError(`"${param}" é um nome reservado`, box.line, box.col);
+      }
     }
     return { ok: true, box };
   } catch (e) {
@@ -58,10 +80,12 @@ export function compileBox(source: string, signature: BoxSignature): CompileResu
 
 class OpLimitError extends DslError {}
 
-/** Resultado de `return`, propagado como exceção para sair de blocos aninhados. */
+/** Sinais de controle, propagados como exceções para sair de blocos aninhados. */
 class ReturnSignal {
   constructor(readonly value: Value) {}
 }
+class BreakSignal {}
+class ContinueSignal {}
 
 interface Binding {
   value: Value;
@@ -72,8 +96,13 @@ interface Binding {
  * Executa uma caixa compilada. `opLimit` limita as operações desta chamada
  * (o menor entre o teto por chamada e a energia restante no turno).
  */
-export function runBox(box: BoxDef, args: Value[], opLimit = MAX_OPS_PER_CALL): RunResult {
-  const run = new Execution(opLimit);
+export function runBox(
+  box: BoxDef,
+  args: Value[],
+  opLimit = MAX_OPS_PER_CALL,
+  host: Record<string, HostFunction> = {},
+): RunResult {
+  const run = new Execution(opLimit, host);
   box.params.forEach((name, i) => run.scope.set(name, { value: args[i] ?? null, mutable: false }));
   try {
     run.execBlock(box.body);
@@ -91,7 +120,10 @@ class Execution {
   ops = 0;
   readonly scope = new Map<string, Binding>();
 
-  constructor(private readonly opLimit: number) {}
+  constructor(
+    private readonly opLimit: number,
+    private readonly host: Record<string, HostFunction>,
+  ) {}
 
   private tick(at: Pos): void {
     this.ops++;
@@ -112,8 +144,12 @@ class Execution {
         return;
       case 'return':
         throw new ReturnSignal(this.eval(stmt.value));
+      case 'break':
+        throw new BreakSignal();
+      case 'continue':
+        throw new ContinueSignal();
       case 'declare': {
-        if (stmt.name in GLOBALS) throw this.error(`"${stmt.name}" é um nome reservado`, stmt);
+        this.checkAssignable(stmt.name, stmt);
         if (this.scope.has(stmt.name)) throw this.error(`"${stmt.name}" já foi declarada`, stmt);
         this.scope.set(stmt.name, { value: this.eval(stmt.value), mutable: stmt.mutable });
         return;
@@ -121,7 +157,7 @@ class Execution {
       case 'assign': {
         const binding = this.scope.get(stmt.name);
         if (!binding) {
-          if (stmt.name in GLOBALS) throw this.error(`"${stmt.name}" é um nome reservado`, stmt);
+          this.checkAssignable(stmt.name, stmt);
           throw this.error(`"${stmt.name}" não foi declarada: use "let ${stmt.name} = ..."`, stmt);
         }
         if (!binding.mutable) throw this.error(`"${stmt.name}" não pode ser alterada (é const ou parâmetro)`, stmt);
@@ -130,7 +166,7 @@ class Execution {
       }
       case 'if': {
         for (const branch of stmt.branches) {
-          if (this.truthy(this.eval(branch.test), branch.test)) {
+          if (isTruthy(this.eval(branch.test))) {
             this.execBlock(branch.body);
             return;
           }
@@ -138,7 +174,32 @@ class Execution {
         if (stmt.orElse) this.execBlock(stmt.orElse);
         return;
       }
+      case 'for': {
+        const items = this.eval(stmt.iterable);
+        if (!Array.isArray(items)) throw this.error(`"for" percorre listas, recebeu ${typeName(items)}`, stmt.iterable);
+        this.checkAssignable(stmt.name, stmt);
+        const existing = this.scope.get(stmt.name);
+        if (existing && !existing.mutable) {
+          throw this.error(`"${stmt.name}" não pode ser a variável do laço (é const ou parâmetro)`, stmt);
+        }
+        for (const item of [...items]) {
+          this.tick(stmt);
+          this.scope.set(stmt.name, { value: item, mutable: true });
+          try {
+            this.execBlock(stmt.body);
+          } catch (e) {
+            if (e instanceof BreakSignal) break;
+            if (e instanceof ContinueSignal) continue;
+            throw e;
+          }
+        }
+        return;
+      }
     }
+  }
+
+  private checkAssignable(name: string, at: Pos): void {
+    if (name in GLOBALS || name in this.host) throw this.error(`"${name}" é um nome reservado`, at);
   }
 
   private eval(expr: Expr): Value {
@@ -153,6 +214,7 @@ class Execution {
         const binding = this.scope.get(expr.name);
         if (binding) return binding.value;
         if (expr.name in GLOBALS) return GLOBALS[expr.name];
+        if (expr.name in this.host) return { t: 'funcao', name: expr.name };
         throw this.error(`"${expr.name}" não existe`, expr);
       }
       case 'list':
@@ -161,7 +223,7 @@ class Execution {
       case 'unary': {
         this.tick(expr);
         const operand = this.eval(expr.operand);
-        if (expr.op === 'not') return !this.truthy(operand, expr.operand);
+        if (expr.op === 'not') return !isTruthy(operand);
         return -this.number(operand, expr.operand, '-');
       }
       case 'binary':
@@ -169,9 +231,10 @@ class Execution {
         return this.evalBinary(expr);
       case 'member': {
         this.tick(expr);
-        const object = this.usable(this.eval(expr.object), expr.object);
+        const object = this.eval(expr.object);
         if (object === null || typeof object !== 'object' || Array.isArray(object) || object.t !== 'registro') {
-          throw this.error(`${typeName(object)} não tem campos`, expr);
+          const hint = object === null ? ' (o valor é None)' : '';
+          throw this.error(`${typeName(object)} não tem campos${hint}`, expr);
         }
         if (!(expr.property in object.fields)) {
           const fields = Object.keys(object.fields).join(', ');
@@ -181,15 +244,25 @@ class Execution {
       }
       case 'index': {
         this.tick(expr);
-        const object = this.usable(this.eval(expr.object), expr.object);
+        const object = this.eval(expr.object);
         if (!Array.isArray(object)) throw this.error(`${typeName(object)} não pode ser indexado`, expr);
-        const index = this.number(this.eval(expr.index), expr.index, '[]');
-        if (!Number.isInteger(index)) throw this.error('o índice deve ser inteiro', expr.index);
+        const index = this.integer(this.eval(expr.index), expr.index, '[]');
         const i = index < 0 ? object.length + index : index;
         if (i < 0 || i >= object.length) {
           throw this.error(`índice ${index} fora da lista de tamanho ${object.length}`, expr.index);
         }
         return object[i];
+      }
+      case 'slice': {
+        this.tick(expr);
+        const object = this.eval(expr.object);
+        if (!Array.isArray(object)) throw this.error(`${typeName(object)} não pode ser fatiado`, expr);
+        const bound = (e: Expr | null, fallback: number) => {
+          if (!e) return fallback;
+          const n = this.integer(this.eval(e), e, '[:]');
+          return n < 0 ? Math.max(0, object.length + n) : Math.min(n, object.length);
+        };
+        return object.slice(bound(expr.start, 0), bound(expr.end, object.length));
       }
       case 'call': {
         this.tick(expr);
@@ -197,7 +270,7 @@ class Execution {
         if (callee === null || typeof callee !== 'object' || Array.isArray(callee) || callee.t !== 'funcao') {
           throw this.error(`${typeName(callee)} não é uma função`, expr);
         }
-        return this.callBuiltin(callee, expr.args.map((arg) => this.eval(arg)), expr);
+        return this.call(callee, expr.args.map((arg) => this.eval(arg)), expr);
       }
     }
   }
@@ -206,21 +279,22 @@ class Execution {
     const { op } = expr;
     if (op === 'and') {
       const left = this.eval(expr.left);
-      return this.truthy(left, expr.left) ? this.eval(expr.right) : left;
+      return isTruthy(left) ? this.eval(expr.right) : left;
     }
     if (op === 'or') {
       const left = this.eval(expr.left);
-      return this.truthy(left, expr.left) ? left : this.eval(expr.right);
+      return isTruthy(left) ? left : this.eval(expr.right);
     }
     if (op === '??') {
       const left = this.eval(expr.left);
       return left === null ? this.eval(expr.right) : left;
     }
 
-    const left = this.usable(this.eval(expr.left), expr.left);
-    const right = this.usable(this.eval(expr.right), expr.right);
+    const left = this.eval(expr.left);
+    const right = this.eval(expr.right);
     if (op === '==') return valuesEqual(left, right);
     if (op === '!=') return !valuesEqual(left, right);
+    if (op === '+' && Array.isArray(left) && Array.isArray(right)) return [...left, ...right];
 
     const a = this.number(left, expr.left, op);
     const b = this.number(right, expr.right, op);
@@ -248,11 +322,13 @@ class Execution {
     }
   }
 
-  private callBuiltin(fn: BuiltinValue, args: Value[], at: Pos): Value {
+  private call(fn: BuiltinValue, args: Value[], at: Pos): Value {
+    const hostFn = this.host[fn.name];
+    if (hostFn) return hostFn(args, at);
     switch (fn.name) {
       case 'saida': {
         if (args.length !== 1) throw this.error('saida() recebe exatamente uma cor', at);
-        const c = this.usable(args[0], at);
+        const c = args[0];
         if (c === null) throw this.error('saida(None): a cor é None (pulso velado?)', at);
         if (typeof c !== 'object' || Array.isArray(c) || c.t !== 'cor') {
           throw this.error(`saida() espera uma Cor, recebeu ${typeName(c)}`, at);
@@ -262,33 +338,33 @@ class Execution {
       }
       case 'len': {
         if (args.length !== 1) throw this.error('len() recebe exatamente uma lista', at);
-        const list = this.usable(args[0], at);
+        const list = args[0];
         if (!Array.isArray(list)) throw this.error(`len() espera uma lista, recebeu ${typeName(list)}`, at);
         return list.length;
+      }
+      case 'range': {
+        if (args.length !== 1) throw this.error('range() recebe um número: range(n) dá 0, 1, …, n−1', at);
+        const n = this.integer(args[0], at, 'range()');
+        if (n < 0 || n > MAX_RANGE) throw this.error(`range() aceita de 0 a ${MAX_RANGE}`, at);
+        return Array.from({ length: n }, (_, i) => i);
       }
       default:
         throw this.error(`função desconhecida: ${fn.name}`, at);
     }
   }
 
-  private usable(v: Value, at: Pos): Value {
-    if (v !== null && typeof v === 'object' && !Array.isArray(v) && v.t === 'bloqueado') {
-      throw this.error(lockedMessage(v.feature), at);
+  private number(v: Value, at: Pos, op: string): number {
+    if (typeof v !== 'number') {
+      const hint = v === null ? ' (pulso velado? use "??")' : '';
+      throw this.error(`"${op}" espera número, recebeu ${typeName(v)}${hint}`, at);
     }
     return v;
   }
 
-  private truthy(v: Value, at: Pos): boolean {
-    return isTruthy(this.usable(v, at));
-  }
-
-  private number(v: Value, at: Pos, op: string): number {
-    const usable = this.usable(v, at);
-    if (typeof usable !== 'number') {
-      const hint = usable === null ? ' (pulso velado? use "??")' : '';
-      throw this.error(`"${op}" espera número, recebeu ${typeName(usable)}${hint}`, at);
-    }
-    return usable;
+  private integer(v: Value, at: Pos, op: string): number {
+    const n = this.number(v, at, op);
+    if (!Number.isInteger(n)) throw this.error(`"${op}" espera um número inteiro`, at);
+    return n;
   }
 
   private error(message: string, at: Pos): DslError {

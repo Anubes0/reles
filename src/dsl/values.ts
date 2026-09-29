@@ -1,5 +1,4 @@
-import type { PulseColor } from '../core/colors';
-import type { LockedFeature } from './errors';
+import type { PulseColor, RouteAction, Shape } from '../core/colors';
 
 export interface ColorValue {
   t: 'cor';
@@ -15,15 +14,19 @@ export interface TerraValue {
 export interface ManualValue {
   t: 'manual';
 }
+/** Direção de um relé ou ação do Roteador: NORTE, LESTE, SUL, ESPERAR, MANTER. */
+export interface DirValue {
+  t: 'dir';
+  d: RouteAction;
+}
+export interface ShapeValue {
+  t: 'forma';
+  f: Shape;
+}
 export interface RecordValue {
   t: 'registro';
   tipo: string;
   fields: Record<string, Value>;
-}
-/** Valor de um recurso ainda bloqueado (ex.: `hist`): qualquer uso gera erro. */
-export interface LockedValue {
-  t: 'bloqueado';
-  feature: LockedFeature;
 }
 export interface BuiltinValue {
   t: 'funcao';
@@ -39,8 +42,9 @@ export type Value =
   | ExitValue
   | TerraValue
   | ManualValue
+  | DirValue
+  | ShapeValue
   | RecordValue
-  | LockedValue
   | BuiltinValue;
 
 export const TERRA: TerraValue = { t: 'terra' };
@@ -48,6 +52,18 @@ export const MANUAL: ManualValue = { t: 'manual' };
 
 export function color(c: PulseColor): ColorValue {
   return { t: 'cor', c };
+}
+
+export function dir(d: RouteAction): DirValue {
+  return { t: 'dir', d };
+}
+
+export function shape(f: Shape): ShapeValue {
+  return { t: 'forma', f };
+}
+
+export function record(tipo: string, fields: Record<string, Value>): RecordValue {
+  return { t: 'registro', tipo, fields };
 }
 
 export function typeName(v: Value): string {
@@ -64,10 +80,12 @@ export function typeName(v: Value): string {
       return 'TERRA';
     case 'manual':
       return 'MANUAL';
+    case 'dir':
+      return 'Direção';
+    case 'forma':
+      return 'Forma';
     case 'registro':
       return v.tipo;
-    case 'bloqueado':
-      return 'recurso bloqueado';
     case 'funcao':
       return 'função';
   }
@@ -88,12 +106,14 @@ export function formatValue(v: Value): string {
       return 'TERRA';
     case 'manual':
       return 'MANUAL';
+    case 'dir':
+      return v.d;
+    case 'forma':
+      return v.f;
     case 'registro':
       return `${v.tipo}(${Object.entries(v.fields)
         .map(([k, f]) => `${k}=${formatValue(f)}`)
         .join(', ')})`;
-    case 'bloqueado':
-      return '<bloqueado>';
     case 'funcao':
       return `${v.name}()`;
   }
@@ -107,8 +127,21 @@ export function valuesEqual(a: Value, b: Value): boolean {
     return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => valuesEqual(x, b[i]));
   }
   if (a.t !== b.t) return false;
-  if ((a.t === 'cor' || a.t === 'saida') && (b.t === 'cor' || b.t === 'saida')) return a.c === b.c;
-  return a.t === 'terra' || a.t === 'manual';
+  switch (a.t) {
+    case 'cor':
+    case 'saida':
+      return a.c === (b as ColorValue | ExitValue).c;
+    case 'dir':
+      return a.d === (b as DirValue).d;
+    case 'forma':
+      return a.f === (b as ShapeValue).f;
+    case 'terra':
+    case 'manual':
+      return true;
+    case 'registro':
+    case 'funcao':
+      return false;
+  }
 }
 
 /** Verdade ao estilo Python: None, False, 0 e lista vazia são falsos. */
