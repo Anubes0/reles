@@ -82,6 +82,12 @@ src/
 tests/     testes da DSL e do motor (Vitest)
 ```
 
-## Deploy
+## Deploy na Vercel
 
-O projeto é um site estático do Vite: na Vercel, importe o repositório e mantenha o preset **Vite** (build `npm run build`, saída `dist`). Não há funções de servidor por enquanto; os dados ficam no `localStorage` do navegador.
+O projeto é um site estático do Vite, já configurado em `vercel.json` (preset Vite, `npm run build`, saída `dist`, cache longo para os arquivos com hash e cabeçalhos de segurança básicos).
+
+1. Na Vercel, **Add New… → Project** e importe o repositório `Anubes0/reles`.
+2. Mantenha o que a Vercel detectar (Framework: Vite). Não há variáveis de ambiente.
+3. **Deploy.** A cada push na `main`, a Vercel publica de novo; cada pull request ganha uma prévia.
+
+Requer Node 22.12 ou mais novo (campo `engines` do `package.json`). Não há funções de servidor por enquanto: recordes, bagagem e scripts ficam no `localStorage` de cada navegador.
