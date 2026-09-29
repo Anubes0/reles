@@ -2,6 +2,8 @@
 
 Jogo por turnos e infinito: você roteia pulsos coloridos por uma rede de fios e relés e escreve scripts, numa linguagem própria, para automatizar os padrões ocultos que descobrir.
 
+**Jogue em [reles-fawn.vercel.app](https://reles-fawn.vercel.app/).**
+
 ## Rodando
 
 ```bash
