@@ -53,3 +53,9 @@ export interface LogEntry {
   kind: LogKind;
   text: string;
 }
+
+/** O que aconteceu no último turno: a interface usa para animar entregas e avisos. */
+export type TurnEvent =
+  | { kind: 'entrega'; seq: number; cor: PulseColor; dest: Destination; outcome: DeliveryOutcome; points: number; integrity: number }
+  | { kind: 'regime' }
+  | { kind: 'nivel'; from: number; to: number };

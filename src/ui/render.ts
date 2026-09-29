@@ -2,7 +2,7 @@ import { COLOR_LABEL, type Color } from '../core/colors';
 import { COLS, DECISION_COL, destRow, isAssignable, PORTS, portRow, ROWS } from '../game/board';
 import type { Game } from '../game/engine';
 import { levelParams } from '../game/mode';
-import type { Destination, Pulse } from '../game/types';
+import type { Destination, Pulse, TurnEvent } from '../game/types';
 import { BOARD, FONT_MONO, PULSE_FILL } from './theme';
 
 /** Saídas na ordem das linhas: a tecla 1–5 corresponde à linha 0–4. */
@@ -18,9 +18,13 @@ export const OUTPUTS: { row: number; dest: Destination }[] = (
   .map((dest) => ({ row: destRow(dest), dest }))
   .sort((a, b) => a.row - b.row);
 
-const MARGIN = { left: 64, right: 132, top: 30, bottom: 14 };
-const MAX_CELL = 88;
-const TWEEN_MS = 220;
+const MARGIN = { left: 70, right: 150, top: 30, bottom: 16 };
+const MAX_CELL = 92;
+const MIN_CELL = 40;
+const TWEEN_MS = 240;
+const FLASH_MS = 750;
+const FLOAT_MS = 1000;
+const BANNER_MS = 1900;
 
 interface Point {
   x: number;
@@ -36,23 +40,51 @@ interface Hit {
 
 interface OutputBox {
   dest: Destination;
+  row: number;
   x: number;
   y: number;
   w: number;
   h: number;
 }
 
+interface Flash {
+  row: number;
+  color: string;
+  start: number;
+}
+
+interface Floater {
+  row: number;
+  text: string;
+  color: string;
+  start: number;
+  offset: number;
+}
+
+interface Banner {
+  title: string;
+  subtitle: string;
+  color: string;
+  start: number;
+}
+
 /** Posições de antes do turno, para animar a transição. */
 type Snapshot = Map<number, Pulse>;
 
+const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
 export class BoardRenderer {
   private readonly ctx: CanvasRenderingContext2D;
+  private readonly wrap: HTMLElement;
   private cell = MAX_CELL;
   private width = 0;
   private height = 0;
   private hits: Hit[] = [];
   private outputBoxes: OutputBox[] = [];
   private tween: { from: Snapshot; start: number } | null = null;
+  private flashes: Flash[] = [];
+  private floaters: Floater[] = [];
+  private banner: Banner | null = null;
   private frame = 0;
 
   constructor(
@@ -62,7 +94,8 @@ export class BoardRenderer {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Canvas 2D indisponível');
     this.ctx = ctx;
-    new ResizeObserver(() => this.resize()).observe(canvas.parentElement ?? canvas);
+    this.wrap = canvas.parentElement ?? canvas;
+    new ResizeObserver(() => this.resize()).observe(this.wrap);
     this.resize();
   }
 
@@ -72,8 +105,44 @@ export class BoardRenderer {
   }
 
   animateFrom(from: Snapshot): void {
-    this.tween = { from, start: performance.now() };
+    this.tween = reducedMotion() ? null : { from, start: performance.now() };
     this.requestDraw();
+  }
+
+  /** Efeitos do turno: saídas piscam, pontos sobem, mudança de regime ganha uma faixa. */
+  playEvents(events: TurnEvent[]): void {
+    const at = performance.now() + (reducedMotion() ? 0 : TWEEN_MS * 0.7);
+    const perRow = new Map<number, number>();
+    for (const e of events) {
+      if (e.kind === 'entrega') {
+        const row = destRow(e.dest);
+        const color = e.outcome === 'acerto' ? BOARD.good : e.outcome === 'erro' ? BOARD.bad : BOARD.textMuted;
+        this.flashes.push({ row, color, start: at });
+        const text =
+          e.integrity < 0 ? `${e.integrity} integridade` : e.points > 0 ? `+${e.points}` : 'perdido';
+        const offset = perRow.get(row) ?? 0;
+        perRow.set(row, offset + 1);
+        this.floaters.push({ row, text, color, start: at, offset });
+      } else if (e.kind === 'regime') {
+        this.banner = { title: 'MUDANÇA DE REGIME', subtitle: 'a regra oculta mudou', color: BOARD.regime, start: at };
+      } else if (e.kind === 'nivel' && !this.banner) {
+        const up = e.to > e.from;
+        this.banner = {
+          title: `NÍVEL ${e.to}`,
+          subtitle: up ? 'o diretor aumentou a dificuldade' : 'o diretor aliviou a dificuldade',
+          color: BOARD.accent,
+          start: at,
+        };
+      }
+    }
+    this.requestDraw();
+  }
+
+  clearEffects(): void {
+    this.flashes = [];
+    this.floaters = [];
+    this.banner = null;
+    this.tween = null;
   }
 
   requestDraw(): void {
@@ -88,7 +157,7 @@ export class BoardRenderer {
     let best: { id: number; d: number } | null = null;
     for (const h of this.hits) {
       const d = Math.hypot(h.x - x, h.y - y);
-      if (d <= h.r + 6 && (!best || d < best.d)) best = { id: h.id, d };
+      if (d <= h.r + 8 && (!best || d < best.d)) best = { id: h.id, d };
     }
     return best?.id ?? null;
   }
@@ -99,8 +168,14 @@ export class BoardRenderer {
   }
 
   private resize(): void {
-    const parentWidth = (this.canvas.parentElement ?? this.canvas).clientWidth;
-    this.cell = Math.max(44, Math.min(MAX_CELL, (parentWidth - MARGIN.left - MARGIN.right) / COLS));
+    const availW = this.wrap.clientWidth;
+    // Em telas largas o canvas é posicionado sobre a área e cabe na altura dela; nas estreitas,
+    // a altura acompanha a largura (ler a altura da área aí criaria um ciclo com o próprio canvas).
+    const fillsArea = getComputedStyle(this.canvas).position === 'absolute';
+    const availH = fillsArea ? this.wrap.clientHeight : Infinity;
+    const byWidth = (availW - MARGIN.left - MARGIN.right) / COLS;
+    const byHeight = (availH - MARGIN.top - MARGIN.bottom) / ROWS;
+    this.cell = Math.max(MIN_CELL, Math.min(MAX_CELL, byWidth, byHeight));
     this.width = MARGIN.left + this.cell * COLS + MARGIN.right;
     this.height = MARGIN.top + this.cell * ROWS + MARGIN.bottom;
     const dpr = window.devicePixelRatio || 1;
@@ -116,62 +191,84 @@ export class BoardRenderer {
     return { x: MARGIN.left + (col + 0.5) * this.cell, y: MARGIN.top + (row + 0.5) * this.cell };
   }
 
+  private get exitX(): number {
+    return MARGIN.left + COLS * this.cell + 12;
+  }
+
   private draw(): void {
     const { game, selectedId } = this.getState();
     const ctx = this.ctx;
+    const now = performance.now();
     ctx.clearRect(0, 0, this.width, this.height);
-    ctx.fillStyle = BOARD.background;
-    ctx.fillRect(0, 0, this.width, this.height);
 
-    this.drawGrid();
-    this.drawWires();
+    this.drawBackground();
+    this.drawTraces();
     this.drawPorts();
-    this.drawOutputs(levelParams(game.level).palette);
-
-    const selected = game.pulses.find((p) => p.id === selectedId);
-    if (selected?.dest) this.drawPlannedPath(selected);
+    this.drawLitRoutes(game, selectedId);
+    this.drawOutputs(levelParams(game.level).palette, now);
 
     let progress = 1;
     if (this.tween) {
-      progress = Math.min(1, (performance.now() - this.tween.start) / TWEEN_MS);
+      progress = Math.min(1, (now - this.tween.start) / TWEEN_MS);
       if (progress >= 1) this.tween = null;
-      else this.requestDraw();
     }
-    const eased = 1 - Math.pow(1 - progress, 3);
-    this.drawPulses(game, selectedId, eased);
+    this.drawPulses(game, selectedId, 1 - Math.pow(1 - progress, 3));
+    this.drawFloaters(now);
+    this.drawBanner(now);
+
+    if (this.tween || this.flashes.length || this.floaters.length || this.banner) this.requestDraw();
   }
 
-  private drawGrid(): void {
-    const ctx = this.ctx;
-    const band = this.center(0, DECISION_COL);
-    ctx.fillStyle = BOARD.decisionBand;
-    ctx.fillRect(band.x - this.cell / 2, MARGIN.top, this.cell, this.cell * ROWS);
+  // ---- Placa ----
 
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < COLS; c++) {
-        const x = MARGIN.left + c * this.cell;
-        const y = MARGIN.top + r * this.cell;
-        ctx.fillStyle = BOARD.cell;
-        ctx.fillRect(x + 3, y + 3, this.cell - 6, this.cell - 6);
+  private drawBackground(): void {
+    const ctx = this.ctx;
+    const x0 = MARGIN.left;
+    const y0 = MARGIN.top;
+    const w = this.cell * COLS;
+    const h = this.cell * ROWS;
+
+    // Coluna de decisão.
+    const band = this.center(0, DECISION_COL).x - this.cell / 2;
+    ctx.fillStyle = BOARD.decisionBand;
+    ctx.fillRect(band, y0, this.cell, h);
+    ctx.strokeStyle = BOARD.decisionEdge;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 4]);
+    ctx.strokeRect(band + 0.5, y0 + 0.5, this.cell - 1, h - 1);
+    ctx.setLineDash([]);
+
+    // Grade de pontos, como furos de uma placa.
+    ctx.fillStyle = BOARD.gridDot;
+    for (let r = 0; r <= ROWS; r++) {
+      for (let c = 0; c <= COLS; c++) {
+        ctx.beginPath();
+        ctx.arc(x0 + c * this.cell, y0 + r * this.cell, 1.2, 0, Math.PI * 2);
+        ctx.fill();
       }
     }
 
-    ctx.font = `11px ${FONT_MONO}`;
+    ctx.font = `600 10px ${FONT_MONO}`;
     ctx.fillStyle = BOARD.textMuted;
     ctx.textAlign = 'center';
-    ctx.fillText('decisão', band.x, MARGIN.top - 10);
+    ctx.fillText('DECISÃO', band + this.cell / 2, y0 - 11);
+    ctx.textAlign = 'left';
+    ctx.fillText('ENTRADA', 8, y0 - 11);
+    ctx.textAlign = 'right';
+    ctx.fillText('SAÍDA', x0 + w + MARGIN.right - 8, y0 - 11);
   }
 
-  private drawWires(): void {
+  private drawTraces(): void {
     const ctx = this.ctx;
-    ctx.strokeStyle = BOARD.wire;
-    ctx.lineWidth = 2;
-    ctx.lineCap = 'round';
     const bus = this.center(0, DECISION_COL).x;
+    ctx.strokeStyle = BOARD.trace;
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
     ctx.beginPath();
     for (const porta of PORTS) {
       const y = this.center(portRow(porta), 0).y;
-      ctx.moveTo(MARGIN.left - 10, y);
+      ctx.moveTo(MARGIN.left - 8, y);
       ctx.lineTo(bus, y);
     }
     ctx.moveTo(bus, this.center(0, 0).y);
@@ -179,91 +276,181 @@ export class BoardRenderer {
     for (const out of OUTPUTS) {
       const y = this.center(out.row, 0).y;
       ctx.moveTo(bus, y);
-      ctx.lineTo(MARGIN.left + COLS * this.cell + 10, y);
+      ctx.lineTo(this.exitX, y);
     }
     ctx.stroke();
+
+    // Pads onde as trilhas se cruzam com o barramento.
+    for (let r = 0; r < ROWS; r++) {
+      const { y } = this.center(r, 0);
+      ctx.beginPath();
+      ctx.arc(bus, y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = BOARD.pad;
+      ctx.fill();
+      ctx.strokeStyle = BOARD.trace;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
   }
 
   private drawPorts(): void {
     const ctx = this.ctx;
-    const h = this.cell * 0.46;
+    const h = Math.min(34, this.cell * 0.5);
+    const w = MARGIN.left - 24;
     for (const porta of PORTS) {
       const { y } = this.center(portRow(porta), 0);
-      roundRect(ctx, 10, y - h / 2, MARGIN.left - 22, h, 6);
-      ctx.fillStyle = BOARD.cell;
+      roundRect(ctx, 8, y - h / 2, w, h, 6);
+      ctx.fillStyle = BOARD.panel;
       ctx.fill();
-      ctx.strokeStyle = BOARD.wire;
+      ctx.strokeStyle = BOARD.trace;
       ctx.lineWidth = 1.5;
       ctx.stroke();
+      // Pinos do conector.
+      ctx.fillStyle = BOARD.pin;
+      ctx.fillRect(8 + w, y - 5, 6, 3);
+      ctx.fillRect(8 + w, y + 2, 6, 3);
       ctx.fillStyle = BOARD.text;
-      ctx.font = `600 12px ${FONT_MONO}`;
+      ctx.font = `700 12px ${FONT_MONO}`;
       ctx.textAlign = 'center';
-      ctx.fillText(`P${porta}`, 10 + (MARGIN.left - 22) / 2, y + 4);
+      ctx.fillText(`P${porta}`, 8 + w / 2, y + 4);
     }
   }
 
-  private drawOutputs(palette: readonly Color[]): void {
+  /** Cada pulso com destino acende a trilha que vai percorrer. */
+  private drawLitRoutes(game: Game, selectedId: number | null): void {
     const ctx = this.ctx;
-    const x = MARGIN.left + COLS * this.cell + 10;
-    const w = MARGIN.right - 18;
-    const h = this.cell * 0.58;
-    this.outputBoxes = [];
-    OUTPUTS.forEach((out, i) => {
-      const { y } = this.center(out.row, 0);
-      const active = out.dest.kind === 'terra' || palette.includes(out.dest.cor);
-      const accent = out.dest.kind === 'terra' ? PULSE_FILL.GRAY : PULSE_FILL[out.dest.cor];
-      roundRect(ctx, x, y - h / 2, w, h, 8);
-      ctx.fillStyle = BOARD.cell;
-      ctx.fill();
-      ctx.strokeStyle = active ? accent : BOARD.inactive;
-      ctx.lineWidth = active ? 2 : 1;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    for (const pulse of game.pulses) {
+      if (!pulse.dest) continue;
+      const selected = pulse.id === selectedId;
+      const color = destColor(pulse.dest);
+      ctx.strokeStyle = color;
+      ctx.globalAlpha = selected ? 0.95 : 0.3;
+      ctx.lineWidth = selected ? 3 : 2;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = selected ? 10 : 4;
+      ctx.setLineDash(selected ? [7, 5] : []);
+      ctx.beginPath();
+      this.routePoints(pulse).forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
       ctx.stroke();
-
-      ctx.textAlign = 'left';
-      ctx.font = `600 12px ${FONT_MONO}`;
-      ctx.fillStyle = active ? BOARD.text : BOARD.inactive;
-      const name = out.dest.kind === 'terra' ? 'TERRA ⏚' : out.dest.cor;
-      ctx.fillText(name, x + 30, y + 4);
-      ctx.font = `11px ${FONT_MONO}`;
-      ctx.fillStyle = BOARD.textMuted;
-      ctx.fillText(String(i + 1), x + 11, y + 4);
-      if (!active) ctx.fillText('inativa', x + 30, y + h / 2 - 5);
-
-      this.outputBoxes.push({ dest: out.dest, x, y: y - h / 2, w, h });
-    });
+    }
+    ctx.restore();
   }
 
-  private drawPlannedPath(pulse: Pulse): void {
-    if (!pulse.dest) return;
-    const ctx = this.ctx;
-    const target = destRow(pulse.dest);
+  private routePoints(pulse: Pulse): Point[] {
+    const target = destRow(pulse.dest!);
     const points: Point[] = [this.center(pulse.row, pulse.col)];
     if (pulse.col <= DECISION_COL) {
       points.push(this.center(pulse.row, DECISION_COL), this.center(target, DECISION_COL));
     }
-    points.push({ x: MARGIN.left + COLS * this.cell + 10, y: this.center(target, 0).y });
-    ctx.save();
-    ctx.setLineDash([6, 6]);
-    ctx.strokeStyle = destColor(pulse.dest);
-    ctx.globalAlpha = 0.7;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    points.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
-    ctx.stroke();
-    ctx.restore();
+    points.push({ x: this.exitX, y: this.center(target, 0).y });
+    return points;
   }
+
+  private drawOutputs(palette: readonly Color[], now: number): void {
+    const ctx = this.ctx;
+    const x = this.exitX;
+    const w = MARGIN.right - 20;
+    const h = Math.min(44, this.cell * 0.6);
+    this.outputBoxes = [];
+    this.flashes = this.flashes.filter((f) => now - f.start < FLASH_MS);
+
+    OUTPUTS.forEach((out, i) => {
+      const { y } = this.center(out.row, 0);
+      const active = out.dest.kind === 'terra' || palette.includes(out.dest.cor);
+      const accent = destColor(out.dest);
+      const top = y - h / 2;
+
+      // Brilho da entrega.
+      for (const f of this.flashes) {
+        if (f.row !== out.row || now < f.start) continue;
+        const t = (now - f.start) / FLASH_MS;
+        ctx.save();
+        ctx.globalAlpha = 1 - t;
+        ctx.shadowColor = f.color;
+        ctx.shadowBlur = 24;
+        ctx.strokeStyle = f.color;
+        ctx.lineWidth = 3;
+        roundRect(ctx, x - 3 - t * 4, top - 3 - t * 4, w + 6 + t * 8, h + 6 + t * 8, 10);
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      roundRect(ctx, x, top, w, h, 8);
+      ctx.fillStyle = BOARD.panel;
+      ctx.fill();
+      ctx.strokeStyle = active ? accent : BOARD.inactive;
+      ctx.globalAlpha = active ? 0.9 : 1;
+      ctx.lineWidth = active ? 1.5 : 1;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      // Tecla de atalho.
+      roundRect(ctx, x + 8, y - 9, 18, 18, 4);
+      ctx.strokeStyle = BOARD.inactive;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = BOARD.textMuted;
+      ctx.font = `600 11px ${FONT_MONO}`;
+      ctx.textAlign = 'center';
+      ctx.fillText(String(i + 1), x + 17, y + 4);
+
+      // LED ou símbolo de terra.
+      const ledX = x + 40;
+      if (out.dest.kind === 'terra') {
+        ctx.strokeStyle = accent;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(ledX, y - 7);
+        ctx.lineTo(ledX, y - 1);
+        ctx.moveTo(ledX - 7, y - 1);
+        ctx.lineTo(ledX + 7, y - 1);
+        ctx.moveTo(ledX - 4.5, y + 3);
+        ctx.lineTo(ledX + 4.5, y + 3);
+        ctx.moveTo(ledX - 2, y + 7);
+        ctx.lineTo(ledX + 2, y + 7);
+        ctx.stroke();
+      } else {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(ledX, y, 6, 0, Math.PI * 2);
+        ctx.fillStyle = active ? accent : BOARD.inactive;
+        if (active) {
+          ctx.shadowColor = accent;
+          ctx.shadowBlur = 10;
+        }
+        ctx.fill();
+        ctx.restore();
+      }
+
+      ctx.textAlign = 'left';
+      ctx.font = `700 12px ${FONT_MONO}`;
+      ctx.fillStyle = active ? BOARD.text : BOARD.inactive;
+      ctx.fillText(out.dest.kind === 'terra' ? 'TERRA' : out.dest.cor, x + 54, active ? y + 4 : y);
+      if (!active) {
+        ctx.font = `10px ${FONT_MONO}`;
+        ctx.fillText('inativa', x + 54, y + 12);
+      }
+
+      this.outputBoxes.push({ dest: out.dest, row: out.row, x, y: top, w, h });
+    });
+  }
+
+  // ---- Pulsos ----
 
   private drawPulses(game: Game, selectedId: number | null, t: number): void {
     const ctx = this.ctx;
-    const r = this.cell * 0.24;
+    const r = Math.max(11, this.cell * 0.23);
     this.hits = [];
 
-    // Pulsos que acabaram de sair da grade deslizam até a saída e somem.
+    // Pulsos que acabaram de sair deslizam até a saída e somem.
     if (this.tween && t < 1) {
       for (const [id, before] of this.tween.from) {
         if (game.pulses.some((p) => p.id === id)) continue;
         const from = this.center(before.row, before.col);
-        const to = { x: MARGIN.left + COLS * this.cell + 10, y: from.y };
+        const to = { x: this.exitX + 10, y: from.y };
         ctx.globalAlpha = 1 - t;
         this.drawPulse(before, lerp(from, to, t), r, false);
         ctx.globalAlpha = 1;
@@ -293,13 +480,18 @@ export class BoardRenderer {
     const ctx = this.ctx;
 
     if (selected) {
+      ctx.save();
       ctx.beginPath();
-      ctx.arc(pos.x, pos.y, r + 6, 0, Math.PI * 2);
+      ctx.arc(pos.x, pos.y, r + 7, 0, Math.PI * 2);
       ctx.strokeStyle = BOARD.selection;
+      ctx.shadowColor = BOARD.selection;
+      ctx.shadowBlur = 8;
       ctx.lineWidth = 2;
       ctx.stroke();
+      ctx.restore();
     }
 
+    ctx.save();
     ctx.beginPath();
     ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
     if (pulse.velado) {
@@ -315,14 +507,22 @@ export class BoardRenderer {
       ctx.textAlign = 'center';
       ctx.fillText('?', pos.x, pos.y + r * 0.36);
     } else {
-      ctx.fillStyle = PULSE_FILL[pulse.cor];
+      const color = PULSE_FILL[pulse.cor];
+      ctx.shadowColor = color;
+      ctx.shadowBlur = pulse.cor === 'GRAY' ? 4 : 14;
+      const grad = ctx.createRadialGradient(pos.x - r * 0.35, pos.y - r * 0.35, r * 0.1, pos.x, pos.y, r);
+      grad.addColorStop(0, '#ffffff');
+      grad.addColorStop(0.25, color);
+      grad.addColorStop(1, color);
+      ctx.fillStyle = grad;
       ctx.fill();
     }
+    ctx.restore();
 
-    ctx.font = `10px ${FONT_MONO}`;
+    ctx.font = `600 10px ${FONT_MONO}`;
     ctx.fillStyle = BOARD.textMuted;
     ctx.textAlign = 'center';
-    ctx.fillText(`#${pulse.seq}`, pos.x, pos.y + r + 12);
+    ctx.fillText(`#${pulse.seq}`, pos.x, pos.y + r + 13);
 
     this.drawDestinationBadge(pulse, pos, r);
   }
@@ -330,22 +530,22 @@ export class BoardRenderer {
   /** Selo no canto do pulso: para onde ele vai e quem decidiu. */
   private drawDestinationBadge(pulse: Pulse, pos: Point, r: number): void {
     const ctx = this.ctx;
-    const b = { x: pos.x + r * 0.78, y: pos.y - r * 0.78 };
-    const br = Math.max(5, r * 0.36);
+    const b = { x: pos.x + r * 0.8, y: pos.y - r * 0.8 };
+    const br = Math.max(5.5, r * 0.36);
     ctx.beginPath();
     ctx.arc(b.x, b.y, br, 0, Math.PI * 2);
 
     if (!pulse.dest) {
       const urgent = isAssignable(pulse) && pulse.col === DECISION_COL;
-      ctx.fillStyle = BOARD.background;
+      ctx.fillStyle = urgent ? BOARD.warning : BOARD.panel;
       ctx.fill();
       ctx.strokeStyle = urgent ? BOARD.warning : BOARD.textMuted;
       ctx.lineWidth = 1.5;
       ctx.stroke();
-      ctx.fillStyle = urgent ? BOARD.warning : BOARD.textMuted;
-      ctx.font = `700 ${Math.round(br * 1.4)}px ${FONT_MONO}`;
+      ctx.fillStyle = urgent ? BOARD.background : BOARD.textMuted;
+      ctx.font = `800 ${Math.round(br * 1.35)}px ${FONT_MONO}`;
       ctx.textAlign = 'center';
-      ctx.fillText(urgent ? '!' : '·', b.x, b.y + br * 0.5);
+      ctx.fillText(urgent ? '!' : '·', b.x, b.y + br * 0.48);
       return;
     }
 
@@ -356,10 +556,67 @@ export class BoardRenderer {
     ctx.stroke();
     if (pulse.dest.kind === 'terra') {
       ctx.fillStyle = BOARD.background;
-      ctx.font = `700 ${Math.round(br * 1.2)}px ${FONT_MONO}`;
+      ctx.font = `800 ${Math.round(br * 1.2)}px ${FONT_MONO}`;
       ctx.textAlign = 'center';
       ctx.fillText('T', b.x, b.y + br * 0.42);
     }
+  }
+
+  // ---- Efeitos ----
+
+  private drawFloaters(now: number): void {
+    const ctx = this.ctx;
+    this.floaters = this.floaters.filter((f) => now - f.start < FLOAT_MS);
+    const rise = reducedMotion() ? 0 : 26;
+    for (const f of this.floaters) {
+      if (now < f.start) continue;
+      const t = (now - f.start) / FLOAT_MS;
+      const box = this.outputBoxes.find((b) => b.row === f.row);
+      if (!box) continue;
+      ctx.save();
+      ctx.globalAlpha = t < 0.15 ? t / 0.15 : 1 - (t - 0.15) / 0.85;
+      ctx.font = `700 13px ${FONT_MONO}`;
+      // À esquerda da caixa, sobre a trilha: não cobre as saídas vizinhas.
+      ctx.textAlign = 'right';
+      ctx.fillStyle = f.color;
+      ctx.shadowColor = BOARD.background;
+      ctx.shadowBlur = 6;
+      ctx.fillText(f.text, box.x - 10, box.y + box.h / 2 - 6 - f.offset * 15 - rise * t);
+      ctx.restore();
+    }
+  }
+
+  private drawBanner(now: number): void {
+    const b = this.banner;
+    if (!b) return;
+    const t = (now - b.start) / BANNER_MS;
+    if (t >= 1) {
+      this.banner = null;
+      return;
+    }
+    if (t < 0) return;
+    const ctx = this.ctx;
+    const alpha = t < 0.12 ? t / 0.12 : t > 0.75 ? (1 - t) / 0.25 : 1;
+    const cy = MARGIN.top + (this.cell * ROWS) / 2;
+    const bandH = 64;
+    ctx.save();
+    ctx.globalAlpha = alpha * 0.92;
+    ctx.fillStyle = BOARD.background;
+    ctx.fillRect(0, cy - bandH / 2, this.width, bandH);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = b.color;
+    ctx.fillRect(0, cy - bandH / 2, this.width, 2);
+    ctx.fillRect(0, cy + bandH / 2 - 2, this.width, 2);
+    ctx.textAlign = 'center';
+    ctx.font = `800 20px ${FONT_MONO}`;
+    ctx.shadowColor = b.color;
+    ctx.shadowBlur = 16;
+    ctx.fillText(b.title, this.width / 2, cy + 2);
+    ctx.shadowBlur = 0;
+    ctx.font = `12px ${FONT_MONO}`;
+    ctx.fillStyle = BOARD.text;
+    ctx.fillText(b.subtitle, this.width / 2, cy + 20);
+    ctx.restore();
   }
 }
 

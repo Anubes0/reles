@@ -1,6 +1,37 @@
 import { compileClassifier } from '../game/classifier';
+import { el } from './dom';
+import { BUILTINS, CONSTANTS, highlightLine, KEYWORDS, PULSE_FIELDS } from './highlight';
 
 const INDENT = '    ';
+const MAX_COMPLETIONS = 7;
+
+const DETAILS: Record<string, string> = {
+  cor: 'Cor, ou None se velado',
+  porta: '1, 2 ou 3',
+  seq: 'nº de sequência do pulso',
+  turno: 'turno em que entrou',
+  saida: 'saida(COR) → destino',
+  len: 'len(lista) → tamanho',
+  TERRA: 'destino: terra',
+  MANUAL: 'deixa o pulso para você',
+  None: 'ausência de valor',
+  RED: 'cor',
+  GREEN: 'cor',
+  BLUE: 'cor',
+  YELLOW: 'cor',
+  GRAY: 'cor do ruído',
+  let: 'variável',
+  const: 'constante',
+};
+const COLOR_WORDS = ['RED', 'GREEN', 'BLUE', 'YELLOW', 'GRAY'];
+
+export interface EditorElements {
+  textarea: HTMLTextAreaElement;
+  highlight: HTMLElement;
+  gutter: HTMLElement;
+  completions: HTMLElement;
+  message: HTMLElement;
+}
 
 export interface EditorCallbacks {
   onChange: (source: string) => void;
@@ -8,73 +39,143 @@ export interface EditorCallbacks {
   onTest: () => void;
 }
 
-/** Editor do script: textarea com numeração de linhas, indentação por Tab e validação ao digitar. */
+interface Completion {
+  label: string;
+  insert: string;
+  detail: string;
+}
+
+/**
+ * Editor do script: textarea transparente sobre uma camada com realce de sintaxe,
+ * numeração de linhas, erro marcado no ponto exato, indentação por Tab e autocompletar.
+ */
 export class CodeEditor {
   private validateTimer = 0;
-  private errorLine: number | null = null;
+  private error: { line: number; col: number } | null = null;
+  private completions: Completion[] = [];
+  private activeCompletion = 0;
+  private completionStart = 0;
 
   constructor(
-    private readonly textarea: HTMLTextAreaElement,
-    private readonly gutter: HTMLElement,
-    private readonly message: HTMLElement,
+    private readonly els: EditorElements,
     private readonly callbacks: EditorCallbacks,
   ) {
-    textarea.addEventListener('input', () => this.changed());
-    textarea.addEventListener('scroll', () => (gutter.scrollTop = textarea.scrollTop));
-    textarea.addEventListener('keydown', (e) => this.onKeyDown(e));
+    const ta = els.textarea;
+    ta.addEventListener('input', (e) => this.changed(e as InputEvent));
+    ta.addEventListener('scroll', () => this.syncScroll());
+    ta.addEventListener('keydown', (e) => this.onKeyDown(e));
+    ta.addEventListener('blur', () => this.closeCompletions());
+    ta.addEventListener('click', () => this.closeCompletions());
+    // Clicar numa sugestão não pode tirar o foco do texto antes de aceitá-la.
+    els.completions.addEventListener('mousedown', (e) => e.preventDefault());
   }
 
   get value(): string {
-    return this.textarea.value;
+    return this.els.textarea.value;
   }
 
   set value(source: string) {
-    this.textarea.value = source;
-    this.renderGutter();
+    this.els.textarea.value = source;
     this.validate();
   }
 
-  /** Mostra uma mensagem de erro externa (ex.: ao aplicar) marcando a linha. */
-  showError(text: string, line: number | null): void {
-    this.errorLine = line;
-    this.message.className = 'editor-msg error';
-    this.message.textContent = line ? `Linha ${line}: ${text}` : text;
-    this.renderGutter();
+  focus(): void {
+    this.els.textarea.focus();
   }
 
-  private changed(): void {
-    this.renderGutter();
+  /** Mostra uma mensagem de erro externa (ex.: ao aplicar), marcando linha e coluna. */
+  showError(text: string, line: number | null, col = 1): void {
+    this.error = line ? { line, col } : null;
+    this.els.message.className = 'editor-msg error';
+    this.els.message.textContent = line ? `Linha ${line}: ${text}` : text;
+    this.render();
+  }
+
+  private changed(e?: InputEvent): void {
+    this.render();
     window.clearTimeout(this.validateTimer);
     this.validateTimer = window.setTimeout(() => this.validate(), 250);
     this.callbacks.onChange(this.value);
+    if (e?.inputType?.startsWith('insert')) this.updateCompletions();
+    else this.closeCompletions();
   }
 
   private validate(): void {
     const result = compileClassifier(this.value);
     if (result.ok) {
-      this.errorLine = null;
-      this.message.className = 'editor-msg ok';
-      this.message.textContent = 'Sintaxe ok.';
-      this.renderGutter();
+      this.error = null;
+      this.els.message.className = 'editor-msg ok';
+      this.els.message.textContent = 'Sintaxe ok.';
+      this.render();
     } else {
-      this.showError(result.error.message, result.error.line);
+      this.showError(result.error.message, result.error.line, result.error.col);
     }
   }
 
-  private renderGutter(): void {
-    const lines = this.value.split('\n').length;
-    const frag = document.createDocumentFragment();
-    for (let i = 1; i <= lines; i++) {
-      const span = document.createElement('span');
-      span.textContent = `${i}\n`;
-      if (i === this.errorLine) span.className = 'err';
-      frag.append(span);
-    }
-    this.gutter.replaceChildren(frag);
-    this.gutter.scrollTop = this.textarea.scrollTop;
+  // ---- Camadas visuais ----
+
+  private render(): void {
+    const lines = this.value.split('\n');
+    const gutter = document.createDocumentFragment();
+    const code = document.createDocumentFragment();
+
+    lines.forEach((line, i) => {
+      const lineNo = i + 1;
+      const isErr = this.error?.line === lineNo;
+      gutter.append(el('span', { class: isErr ? 'err' : '' }, `${lineNo}\n`));
+
+      const lineEl = el('span', { class: isErr ? 'line err-line' : 'line' });
+      let col = 1;
+      let marked = false;
+      for (const span of highlightLine(line)) {
+        const end = col + span.text.length;
+        const hit = isErr && !marked && this.error!.col >= col && this.error!.col < end && span.text.trim() !== '';
+        if (hit) marked = true;
+        const cls = [span.cls, hit ? 'err-token' : ''].filter(Boolean).join(' ');
+        lineEl.append(cls ? el('span', { class: cls }, span.text) : span.text);
+        col = end;
+      }
+      if (isErr && !marked) lineEl.append(el('span', { class: 'err-token err-eol' }, ' '));
+      code.append(lineEl, '\n');
+    });
+    // Espaço extra para a última linha ter a mesma altura que no textarea.
+    code.append(' ');
+
+    this.els.gutter.replaceChildren(gutter);
+    this.els.highlight.replaceChildren(code);
+    this.syncScroll();
   }
+
+  private syncScroll(): void {
+    const ta = this.els.textarea;
+    this.els.highlight.scrollTop = ta.scrollTop;
+    this.els.highlight.scrollLeft = ta.scrollLeft;
+    this.els.gutter.scrollTop = ta.scrollTop;
+    if (this.completions.length) this.positionCompletions();
+  }
+
+  // ---- Teclado ----
 
   private onKeyDown(e: KeyboardEvent): void {
+    if (this.completions.length > 0) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        this.activeCompletion = (this.activeCompletion + step + this.completions.length) % this.completions.length;
+        this.renderCompletions();
+        return;
+      }
+      if ((e.key === 'Enter' && !e.ctrlKey && !e.metaKey) || e.key === 'Tab') {
+        e.preventDefault();
+        this.acceptCompletion(this.activeCompletion);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        this.closeCompletions();
+        return;
+      }
+    }
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       if (e.shiftKey) this.callbacks.onTest();
@@ -82,7 +183,12 @@ export class CodeEditor {
       return;
     }
     if (e.key === 'Escape') {
-      this.textarea.blur();
+      this.els.textarea.blur();
+      return;
+    }
+    if (e.key === ' ' && e.ctrlKey) {
+      e.preventDefault();
+      this.updateCompletions(true);
       return;
     }
     if (e.key === 'Tab') {
@@ -97,7 +203,7 @@ export class CodeEditor {
   }
 
   private indent(outdent: boolean): void {
-    const ta = this.textarea;
+    const ta = this.els.textarea;
     const { selectionStart: start, selectionEnd: end, value } = ta;
     const lineStart = value.lastIndexOf('\n', start - 1) + 1;
     if (!outdent && start === end) {
@@ -105,8 +211,10 @@ export class CodeEditor {
       return;
     }
     const block = value.slice(lineStart, end);
-    const lines = block.split('\n');
-    const changed = lines.map((line) => (outdent ? line.replace(/^ {1,4}/, '') : INDENT + line)).join('\n');
+    const changed = block
+      .split('\n')
+      .map((line) => (outdent ? line.replace(/^ {1,4}/, '') : INDENT + line))
+      .join('\n');
     this.replaceRange(lineStart, end, changed, null);
     ta.selectionStart = lineStart;
     ta.selectionEnd = lineStart + changed.length;
@@ -114,7 +222,7 @@ export class CodeEditor {
 
   /** Enter mantém a indentação da linha atual e acrescenta um nível depois de ":". */
   private newlineKeepingIndent(): void {
-    const ta = this.textarea;
+    const ta = this.els.textarea;
     const { selectionStart: start, value } = ta;
     const lineStart = value.lastIndexOf('\n', start - 1) + 1;
     const line = value.slice(lineStart, start);
@@ -126,7 +234,7 @@ export class CodeEditor {
 
   /** Troca um trecho preservando o Ctrl+Z nativo quando o navegador permite. */
   private replaceRange(start: number, end: number, text: string, caret: number | null): void {
-    const ta = this.textarea;
+    const ta = this.els.textarea;
     ta.setSelectionRange(start, end);
     // insertText dispara o evento "input", que já chama changed().
     const inserted = text !== '' && document.execCommand('insertText', false, text);
@@ -136,4 +244,112 @@ export class CodeEditor {
     }
     if (caret !== null) ta.selectionStart = ta.selectionEnd = caret;
   }
+
+  // ---- Autocompletar ----
+
+  private updateCompletions(force = false): void {
+    const ta = this.els.textarea;
+    if (ta.selectionStart !== ta.selectionEnd) return this.closeCompletions();
+    const caret = ta.selectionStart;
+    const before = this.value.slice(0, caret);
+    const prefix = /[A-Za-z_]\w*$/.exec(before)?.[0] ?? '';
+    const start = caret - prefix.length;
+    const lineBefore = before.slice(before.lastIndexOf('\n') + 1);
+    if (lineBefore.includes('#')) return this.closeCompletions();
+
+    const member = /([A-Za-z_]\w*)\.$/.exec(before.slice(0, start));
+    let candidates: Completion[];
+    if (member) {
+      if (member[1] !== this.pulseParam()) return this.closeCompletions();
+      candidates = PULSE_FIELDS.map((f) => ({ label: f, insert: f, detail: DETAILS[f] ?? '' }));
+    } else {
+      if (prefix.length === 0 && !force) return this.closeCompletions();
+      candidates = this.vocabulary();
+    }
+
+    const lower = prefix.toLowerCase();
+    this.completions = candidates
+      .filter((c) => c.label.toLowerCase().startsWith(lower) && c.label !== prefix)
+      .slice(0, MAX_COMPLETIONS);
+    this.completionStart = start;
+    this.activeCompletion = 0;
+    if (this.completions.length === 0) return this.closeCompletions();
+    this.renderCompletions();
+  }
+
+  private pulseParam(): string {
+    return /box\s+\w+\s*\(\s*([A-Za-z_]\w*)/.exec(this.value)?.[1] ?? 'p';
+  }
+
+  /** Palavras da linguagem mais as variáveis e parâmetros que o jogador declarou. */
+  private vocabulary(): Completion[] {
+    const declared = new Set<string>();
+    for (const m of this.value.matchAll(/\b(?:let|const)\s+([A-Za-z_]\w*)/g)) declared.add(m[1]);
+    const params = /box\s+\w+\s*\(([^)]*)\)/.exec(this.value)?.[1] ?? '';
+    for (const p of params.split(',')) if (p.trim()) declared.add(p.trim());
+
+    const word = (label: string, detail = DETAILS[label] ?? '') => ({ label, insert: label, detail });
+    return [
+      ...KEYWORDS.map((k) => word(k, DETAILS[k] ?? 'palavra-chave')),
+      ...COLOR_WORDS.map((c) => word(c)),
+      ...CONSTANTS.map((c) => word(c, DETAILS[c] ?? 'constante')),
+      ...BUILTINS.map((b) => ({ label: b, insert: `${b}(`, detail: DETAILS[b] ?? '' })),
+      ...[...declared].map((d) => word(d, 'sua variável')),
+    ];
+  }
+
+  private acceptCompletion(index: number): void {
+    const item = this.completions[index];
+    if (!item) return;
+    const caret = this.els.textarea.selectionStart;
+    this.closeCompletions();
+    this.replaceRange(this.completionStart, caret, item.insert, this.completionStart + item.insert.length);
+    this.closeCompletions();
+  }
+
+  private closeCompletions(): void {
+    this.completions = [];
+    this.els.completions.hidden = true;
+  }
+
+  private renderCompletions(): void {
+    const list = this.els.completions;
+    list.replaceChildren(
+      ...this.completions.map((c, i) => {
+        const item = el('li', { role: 'option', 'aria-selected': String(i === this.activeCompletion) },
+          el('span', { class: 'cmp-label' }, c.label),
+          el('span', { class: 'detail' }, c.detail),
+        );
+        item.addEventListener('click', () => this.acceptCompletion(i));
+        return item;
+      }),
+    );
+    list.hidden = false;
+    this.positionCompletions();
+  }
+
+  /** A fonte é monoespaçada: a posição do cursor sai de linha × coluna. */
+  private positionCompletions(): void {
+    const ta = this.els.textarea;
+    const style = getComputedStyle(ta);
+    const lineHeight = parseFloat(style.lineHeight);
+    // O atalho `font` do estilo computado pode vir vazio: monta a fonte pelas partes.
+    const charWidth = measureChar(`${style.fontWeight} ${style.fontSize} ${style.fontFamily}`);
+    const before = this.value.slice(0, this.completionStart);
+    const line = before.split('\n').length - 1;
+    const col = before.length - before.lastIndexOf('\n') - 1;
+    const x = parseFloat(style.paddingLeft) + col * charWidth - ta.scrollLeft;
+    const y = parseFloat(style.paddingTop) + (line + 1) * lineHeight - ta.scrollTop + 2;
+    const list = this.els.completions;
+    list.style.left = `${Math.max(4, Math.min(x, ta.clientWidth - list.offsetWidth - 4))}px`;
+    list.style.top = `${y}px`;
+  }
+}
+
+let measureCtx: CanvasRenderingContext2D | null = null;
+function measureChar(font: string): number {
+  measureCtx ??= document.createElement('canvas').getContext('2d');
+  if (!measureCtx) return 8;
+  measureCtx.font = font;
+  return measureCtx.measureText('M').width;
 }

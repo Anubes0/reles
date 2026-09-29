@@ -3,12 +3,13 @@ import { isAssignable } from '../game/board';
 import { formatDecision, runBench, type BenchResult } from '../game/bench';
 import { Game, MAX_INTEGRITY } from '../game/engine';
 import { FACIL } from '../game/mode';
-import type { DeliveredPulse, Destination } from '../game/types';
+import type { Destination } from '../game/types';
 import { byId, el } from './dom';
 import { CodeEditor } from './editor';
 import { BoardRenderer, destLabel, OUTPUTS } from './render';
 import { storage } from './storage';
 import { PULSE_FILL } from './theme';
+import { PatternTimeline, timelineItems } from './timeline';
 
 export const DEFAULT_SCRIPT = `# Classificador: decide o destino de cada pulso que entra.
 # Retorne saida(COR), TERRA ou MANUAL (fica por sua conta).
@@ -21,8 +22,10 @@ box classificar(p, hist):
 `;
 
 const BENCH_SIZE = 20;
+const DEFAULT_HINT = 'Clique num pulso (ou Tab) e escolha a saída (clique ou 1–5).';
 
 type Dialog = 'help' | 'pause' | 'over' | 'abandon' | null;
+type Tab = 'log' | 'bench' | 'ref';
 
 export class App {
   private game: Game;
@@ -30,11 +33,14 @@ export class App {
   private dialog: Dialog = null;
   private readonly renderer: BoardRenderer;
   private readonly editor: CodeEditor;
+  private readonly timeline: PatternTimeline;
   private saveTimer = 0;
+  private shown = { score: 0, integrity: MAX_INTEGRITY };
 
   private readonly ui = {
     turn: byId('hud-turn'),
     wave: byId('hud-wave'),
+    waveFill: byId('hud-wave-fill'),
     level: byId('hud-level'),
     score: byId('hud-score'),
     record: byId('hud-record'),
@@ -46,7 +52,6 @@ export class App {
     hint: byId('hint'),
     scriptStatus: byId('script-status'),
     bench: byId('bench'),
-    revealed: byId('revealed'),
     log: byId('log'),
     overlay: byId('overlay'),
     dialog: byId('dialog'),
@@ -56,11 +61,21 @@ export class App {
   constructor() {
     this.game = this.newGame();
     this.renderer = new BoardRenderer(this.ui.canvas, () => ({ game: this.game, selectedId: this.selectedId }));
-    this.editor = new CodeEditor(byId('editor'), byId('gutter'), byId('editor-msg'), {
-      onChange: (source) => this.onEditorChange(source),
-      onApply: () => this.applyScript(),
-      onTest: () => this.testScript(),
-    });
+    this.timeline = new PatternTimeline(byId('timeline'));
+    this.editor = new CodeEditor(
+      {
+        textarea: byId('editor'),
+        highlight: byId('highlight'),
+        gutter: byId('gutter'),
+        completions: byId('completions'),
+        message: byId('editor-msg'),
+      },
+      {
+        onChange: (source) => this.onEditorChange(source),
+        onApply: () => this.applyScript(),
+        onTest: () => this.testScript(),
+      },
+    );
     this.editor.value = storage.script() ?? this.game.script?.source ?? DEFAULT_SCRIPT;
 
     byId('btn-end').addEventListener('click', () => this.endTurn());
@@ -69,9 +84,16 @@ export class App {
     byId('btn-remove').addEventListener('click', () => this.removeScript());
     byId('btn-new').addEventListener('click', () => this.requestNewGame());
     byId('btn-help').addEventListener('click', () => this.openDialog('help'));
+    for (const tab of ['log', 'bench', 'ref'] as const) {
+      byId(`tab-${tab}`).addEventListener('click', () => this.showTab(tab));
+    }
+    for (const button of document.querySelectorAll<HTMLButtonElement>('.seg button')) {
+      button.addEventListener('click', () => this.setGrouping(button.dataset.group ? Number(button.dataset.group) : null));
+    }
     this.ui.canvas.addEventListener('click', (e) => this.onCanvasClick(e));
     document.addEventListener('keydown', (e) => this.onKeyDown(e));
 
+    this.setHint('');
     this.refresh();
     if (!storage.helpSeen()) this.openDialog('help');
   }
@@ -80,13 +102,15 @@ export class App {
 
   private newGame(): Game {
     const seed = (Date.now() ^ (Math.random() * 0x7fffffff)) >>> 0;
-    return new Game(seed, FACIL, storage.baggage(FACIL.id));
+    const game = new Game(seed, FACIL, storage.baggage(FACIL.id));
+    this.shown = { score: 0, integrity: game.integrity };
+    return game;
   }
 
   private startNewGame(): void {
     this.game = this.newGame();
     this.selectedId = null;
-    this.ui.bench.hidden = true;
+    this.renderer.clearEffects();
     this.closeDialog();
     this.setHint(this.game.script ? 'Nova partida: seu Classificador veio na bagagem.' : 'Nova partida.');
     this.refresh();
@@ -115,13 +139,14 @@ export class App {
     const before = this.renderer.snapshot();
     this.game.endTurn();
     this.renderer.animateFrom(before);
+    this.renderer.playEvents(this.game.lastEvents);
 
     const selected = this.game.pulses.find((p) => p.id === this.selectedId);
     if (!selected || !isAssignable(selected)) this.selectedId = null;
     this.setHint('');
 
-    if (this.game.over) this.finishGame();
     this.refresh();
+    if (this.game.over) window.setTimeout(() => this.finishGame(), 700);
   }
 
   private finishGame(): void {
@@ -159,7 +184,7 @@ export class App {
       .filter((p) => !skipAssigned || !p.dest)
       .sort((a, b) => b.col - a.col || a.seq - b.seq);
     if (candidates.length === 0) {
-      this.selectedId = skipAssigned ? null : this.selectedId;
+      if (skipAssigned) this.selectedId = null;
       this.refresh();
       return;
     }
@@ -180,7 +205,7 @@ export class App {
   private applyScript(): void {
     const result = this.game.installScript(this.editor.value);
     if (!result.ok) {
-      this.editor.showError(result.error.message, result.error.line);
+      this.editor.showError(result.error.message, result.error.line, result.error.col);
       this.setHint('O script tem erro e não foi aplicado.', true);
       return;
     }
@@ -196,6 +221,7 @@ export class App {
   }
 
   private testScript(): void {
+    this.showTab('bench');
     const cases = this.game.delivered.slice(-BENCH_SIZE);
     if (cases.length === 0) {
       this.renderBench(null);
@@ -241,7 +267,7 @@ export class App {
     const target = e.target as HTMLElement;
     if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    const onControl = target instanceof HTMLButtonElement || target.tagName === 'SUMMARY';
+    const onControl = target instanceof HTMLButtonElement;
 
     if ((e.key === ' ' || e.key === 'Enter') && !onControl) {
       e.preventDefault();
@@ -257,7 +283,26 @@ export class App {
       if (out) this.assignSelected(out.dest);
     } else if (e.key === 'h' || e.key === 'H') {
       this.openDialog('help');
+    } else if (e.key === 'e' || e.key === 'E') {
+      e.preventDefault();
+      this.editor.focus();
     }
+  }
+
+  private showTab(tab: Tab): void {
+    for (const t of ['log', 'bench', 'ref'] as const) {
+      byId(`tab-${t}`).setAttribute('aria-selected', String(t === tab));
+      byId(`panel-${t}`).hidden = t !== tab;
+    }
+  }
+
+  private setGrouping(k: number | null): void {
+    this.timeline.groupBy = k;
+    for (const button of document.querySelectorAll<HTMLButtonElement>('.seg button')) {
+      const value = button.dataset.group ? Number(button.dataset.group) : null;
+      button.setAttribute('aria-pressed', String(value === k));
+    }
+    this.renderTimeline();
   }
 
   // ---- Diálogos ----
@@ -313,7 +358,9 @@ export class App {
       return [
         el('h2', {}, 'Fim de partida'),
         el('p', { class: 'big' }, String(s.score)),
-        isRecord ? el('p', { class: 'record' }, 'Novo recorde no modo fácil!') : el('p', { class: 'muted' }, `Recorde: ${storage.record(this.game.mode.id)}`),
+        isRecord
+          ? el('p', { class: 'record' }, 'Novo recorde no modo fácil!')
+          : el('p', { class: 'muted' }, `Recorde: ${storage.record(this.game.mode.id)}`),
         el('dl', { class: 'summary-grid' },
           stat('Turnos', String(s.turns)),
           stat('Precisão', precision),
@@ -322,23 +369,32 @@ export class App {
         ),
         el('h3', {}, 'As regras desta partida'),
         el('ol', { class: 'regimes' }, ...s.regimes.map((r) => el('li', {}, r))),
-        el('p', { class: 'muted' }, this.game.script ? 'Seu Classificador segue na bagagem para a próxima partida.' : ''),
+        this.game.script ? el('p', { class: 'muted' }, 'Seu Classificador segue na bagagem para a próxima partida.') : null,
         el('div', { class: 'actions' }, button('Nova partida', () => this.startNewGame(), 'primary', true)),
-      ];
+      ].filter((n) => n !== null);
     }
 
+    const key = (keys: string, what: string) => [el('dt', {}, ...keys.split('+').flatMap((k, i) => (i ? ['+', el('kbd', {}, k)] : [el('kbd', {}, k)]))), el('dd', {}, what)];
     return [
       el('h2', {}, 'Relé — como jogar'),
       el('ul', {},
         el('li', {}, 'Pulsos entram pelas portas P1–P3 e andam uma casa por turno. Cada um deve chegar à saída da sua cor; ruído (cinza) vai para o TERRA.'),
         el('li', {}, 'Na coluna de decisão o pulso segue para o destino escolhido. Sem destino, cai no terra e é perdido.'),
-        el('li', {}, 'Pulsos velados (?) escondem a cor, mas ela segue uma regra oculta. Estude a tabela “Pulsos revelados” para descobri-la.'),
+        el('li', {}, 'Pulsos velados (?) escondem a cor, mas ela segue uma regra oculta. Use a linha do tempo de Sinais para descobri-la.'),
         el('li', {}, 'Você tem 2 ações por turno para definir destinos à mão. Escreva o Classificador para automatizar o que for previsível.'),
         el('li', {}, 'Saída errada: −1 de integridade. Ruído numa saída: −2. Com a integridade zerada, a partida acaba.'),
-        el('li', {}, 'A regra muda de tempos em tempos. No modo fácil, o registro avisa.'),
+        el('li', {}, 'A regra muda de tempos em tempos. No modo fácil, uma faixa avisa.'),
       ),
-      el('p', { class: 'muted' },
-        'Atalhos: Espaço encerra o turno · Tab seleciona pulso · 1–5 escolhe a saída · Esc pausa · H ajuda · no editor, Ctrl+Enter aplica e Ctrl+Shift+Enter testa.',
+      el('h3', {}, 'Atalhos'),
+      el('dl', { class: 'help-keys' },
+        ...key('Espaço', 'encerrar o turno'),
+        ...key('Tab', 'selecionar o próximo pulso'),
+        ...key('1–5', 'enviar à saída da linha correspondente'),
+        ...key('E', 'ir para o editor'),
+        ...key('Esc', 'pausar (no editor: sair dele)'),
+        ...key('Ctrl+Enter', 'aplicar o script'),
+        ...key('Ctrl+Shift+Enter', 'testar na bancada'),
+        ...key('Ctrl+Espaço', 'sugestões no editor'),
       ),
       el('div', { class: 'actions' }, button('Jogar', () => this.closeDialog(), 'primary', true)),
     ];
@@ -347,17 +403,23 @@ export class App {
   // ---- Renderização ----
 
   private setHint(text: string, isError = false): void {
-    this.ui.hint.textContent = text || 'Clique num pulso (ou Tab) e escolha a saída (clique ou 1–5).';
+    this.ui.hint.textContent = text || DEFAULT_HINT;
     this.ui.hint.classList.toggle('error', isError);
   }
 
   private refresh(): void {
     const g = this.game;
     this.ui.turn.textContent = String(g.turn);
-    this.ui.wave.textContent = `${g.wave} · ${g.turnInWave}/${g.mode.waveLength}`;
+    this.ui.wave.textContent = String(g.wave);
+    this.ui.waveFill.style.width = `${(g.turnInWave / g.mode.waveLength) * 100}%`;
+    this.ui.waveFill.parentElement!.title = `Turno ${g.turnInWave} de ${g.mode.waveLength} da onda`;
     this.ui.level.textContent = `${g.level} ×${g.multiplier.toFixed(1)}`;
     this.ui.score.textContent = String(g.score);
     this.ui.record.textContent = String(storage.record(g.mode.id));
+
+    if (g.score > this.shown.score) restartAnimation(this.ui.score, 'bump');
+    if (g.integrity < this.shown.integrity) restartAnimation(this.ui.integrity, 'hit');
+    this.shown = { score: g.score, integrity: g.integrity };
 
     this.ui.integrity.replaceChildren(
       ...Array.from({ length: MAX_INTEGRITY }, (_, i) => el('i', { class: i < g.integrity ? '' : 'lost' })),
@@ -370,21 +432,28 @@ export class App {
         const dot = el('span', { class: q.velado ? 'dot veiled' : 'dot' });
         if (!q.velado) dot.style.background = PULSE_FILL[q.cor];
         const inTurns = q.turn - g.turn;
-        return el('li', { title: q.velado ? 'velado' : COLOR_LABEL[q.cor] }, dot, `#${q.seq} P${q.porta}`, el('span', { class: 'muted' }, inTurns <= 0 ? 'agora' : `+${inTurns}`));
+        return el('li', { title: q.velado ? 'velado' : COLOR_LABEL[q.cor] },
+          dot,
+          `#${q.seq} P${q.porta}`,
+          el('span', { class: 'when' }, inTurns <= 0 ? 'agora' : `+${inTurns}`),
+        );
       }),
     );
 
     this.ui.actions.replaceChildren(
       ...Array.from({ length: g.mode.actionsPerTurn }, (_, i) => el('i', { class: i < g.actionsLeft ? '' : 'used' })),
     );
-    const energyPct = (g.energyLeft / g.mode.energyPerTurn) * 100;
-    this.ui.energyFill.style.width = `${energyPct}%`;
+    this.ui.energyFill.style.width = `${(g.energyLeft / g.mode.energyPerTurn) * 100}%`;
     this.ui.energyValue.textContent = String(g.energyLeft);
 
     this.renderScriptStatus();
-    this.renderRevealed(g.delivered.slice(-g.mode.logSize).reverse());
+    this.renderTimeline();
     this.renderLog();
     this.renderer.requestDraw();
+  }
+
+  private renderTimeline(): void {
+    this.timeline.render(timelineItems(this.game), this.game.mode.announceRegime ? this.game.regimeBoundaries : []);
   }
 
   private renderScriptStatus(): void {
@@ -402,30 +471,12 @@ export class App {
     }
   }
 
-  private renderRevealed(rows: DeliveredPulse[]): void {
-    if (rows.length === 0) {
-      this.ui.revealed.replaceChildren(el('tr', {}, el('td', { colspan: '5', class: 'empty' }, 'Nenhum pulso entregue ainda.')));
-      return;
-    }
-    this.ui.revealed.replaceChildren(
-      ...rows.map((p) => {
-        const dot = el('span', { class: 'dot' });
-        dot.style.background = PULSE_FILL[p.cor];
-        const mark = p.outcome === 'acerto' ? '✓' : p.outcome === 'erro' ? '✗' : '–';
-        const markClass = p.outcome === 'acerto' ? 'pass' : p.outcome === 'erro' ? 'fail' : 'manual';
-        return el('tr', {},
-          el('td', {}, `#${p.seq}`),
-          el('td', {}, String(p.porta)),
-          el('td', {}, dot, ` ${p.cor} `, p.velado ? el('span', { class: 'veil' }, 'velado') : null),
-          el('td', {}, destLabel(p.dest)),
-          el('td', { class: markClass }, mark),
-        );
-      }),
-    );
-  }
-
   private renderLog(): void {
     const entries = this.game.log.slice(-this.game.mode.logSize).reverse();
+    if (entries.length === 0) {
+      this.ui.log.replaceChildren(el('li', { class: 'empty' }, 'Os eventos da partida aparecem aqui.'));
+      return;
+    }
     this.ui.log.replaceChildren(
       ...entries.map((entry) => el('li', {}, el('span', { class: 't' }, String(entry.turn)), el('span', { class: entry.kind }, entry.text))),
     );
@@ -433,7 +484,6 @@ export class App {
 
   private renderBench(result: BenchResult | null): void {
     const bench = this.ui.bench;
-    bench.hidden = false;
     if (!result) {
       bench.replaceChildren(el('p', { class: 'empty' }, 'Ainda não há pulsos entregues para testar. Jogue alguns turnos.'));
       return;
@@ -465,4 +515,11 @@ export class App {
       ),
     );
   }
+}
+
+/** Reinicia uma animação CSS mesmo que a classe já esteja aplicada. */
+function restartAnimation(node: HTMLElement, cls: string): void {
+  node.classList.remove(cls);
+  void node.offsetWidth;
+  node.classList.add(cls);
 }

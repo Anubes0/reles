@@ -17,7 +17,7 @@ npm run build    # checagem de tipos + build de produção em dist/
 
 - Pulsos entram pelas portas **P1–P3** e andam uma casa por turno. Cada um deve chegar à saída da sua cor; ruído (cinza) vai para o **TERRA**.
 - Na **coluna de decisão** o pulso segue para o destino escolhido. Sem destino, cai no terra e é perdido.
-- Pulsos **velados** (`?`) escondem a cor, mas ela segue uma regra oculta. A tabela *Pulsos revelados* mostra a cor real depois da entrega.
+- Pulsos **velados** (`?`) escondem a cor, mas ela segue uma regra oculta. A linha do tempo **Sinais** mostra todos os pulsos por `seq`, uma linha por porta: os velados aparecem como `?` no meio da sequência conhecida, e o agrupamento `%2`/`%3`/`%4` ajuda a enxergar ciclos.
 - Você tem **2 ações por turno** para definir destinos à mão. O **Classificador** automatiza o resto.
 - Saída errada: −1 de integridade. Ruído numa saída: −2. Integridade zero encerra a partida.
 
@@ -26,10 +26,12 @@ npm run build    # checagem de tipos + build de produção em dist/
 | `Espaço` / `Enter` | Encerrar o turno |
 | `Tab` / `Shift+Tab` | Selecionar pulso |
 | `1`–`5` | Enviar o pulso selecionado para a saída daquela linha |
-| `Esc` | Pausar |
+| `E` | Ir para o editor |
+| `Esc` | Pausar (no editor: sair dele) |
 | `H` | Ajuda |
 | `Ctrl+Enter` (no editor) | Aplicar o script |
 | `Ctrl+Shift+Enter` (no editor) | Testar o script na bancada |
+| `Ctrl+Espaço` (no editor) | Sugestões |
 
 ## A linguagem
 
@@ -67,7 +69,7 @@ Fora do MVP, por decisão de escopo: modos médio e difícil, banco de tempo, Ro
 src/
   dsl/     lexer, parser, interpretador e valores da linguagem
   game/    motor de turnos, tabuleiro, padrões, diretor, bancada de testes
-  ui/      interface: Canvas do tabuleiro, editor, armazenamento local
+  ui/      interface: Canvas do tabuleiro, linha do tempo em SVG, editor com realce e sugestões
   core/    cores e gerador pseudoaleatório com semente
 tests/     testes da DSL e do motor (Vitest)
 ```

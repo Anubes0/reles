@@ -15,12 +15,13 @@ import type {
   LogKind,
   Pulse,
   QueuedPulse,
+  TurnEvent,
 } from './types';
 
 export const MAX_INTEGRITY = 10;
 export const QUEUE_SIZE = 3;
 const STREAK_FOR_REPAIR = 20;
-const DELIVERED_KEPT = 30;
+const DELIVERED_KEPT = 40;
 const POINTS_DELIVERY = 10;
 const POINTS_NOISE = 5;
 
@@ -59,6 +60,10 @@ export class Game {
 
   regime: Regime;
   readonly regimesSeen: Regime[] = [];
+  /** `seq` do primeiro pulso de cada regime depois do primeiro. */
+  readonly regimeBoundaries: number[] = [];
+  /** Eventos do último `endTurn()`. */
+  lastEvents: TurnEvent[] = [];
   readonly totals: Totals = { acertos: 0, erros: 0, perdidos: 0 };
   maxLevel = 0;
 
@@ -135,6 +140,7 @@ export class Game {
   /** Executa a etapa do mundo: pulsos andam, entregas são resolvidas e novos pulsos entram. */
   endTurn(): void {
     if (this.over) return;
+    this.lastEvents = [];
 
     for (const pulse of [...this.pulses]) {
       if (advance(pulse)) this.deliver(pulse);
@@ -152,7 +158,18 @@ export class Game {
   private deliver(pulse: Pulse): void {
     this.pulses = this.pulses.filter((p) => p !== pulse);
     const dest = pulse.dest ?? { kind: 'terra' };
+    const scoreBefore = this.score;
+    const integrityBefore = this.integrity;
     const outcome = this.resolve(pulse, dest);
+    this.lastEvents.push({
+      kind: 'entrega',
+      seq: pulse.seq,
+      cor: pulse.cor,
+      dest,
+      outcome,
+      points: this.score - scoreBefore,
+      integrity: this.integrity - integrityBefore,
+    });
 
     this.delivered.push({
       seq: pulse.seq,
@@ -234,6 +251,7 @@ export class Game {
     this.level = nextLevel(this.level, this.waveStats, this.mode.maxLevel);
     this.maxLevel = Math.max(this.maxLevel, this.level);
     if (this.level !== before) {
+      this.lastEvents.push({ kind: 'nivel', from: before, to: this.level });
       const dir = this.level > before ? 'sobe' : 'desce';
       this.addLog('diretor', `Onda ${this.wave}: o diretor ${dir} para o nível ${this.level} (×${this.multiplier.toFixed(1)}).`);
     } else {
@@ -245,6 +263,8 @@ export class Game {
     if (this.regimeWavesLeft <= 0) {
       this.regime = this.newRegime(this.regime);
       this.regimeWavesLeft = this.rng.int(...this.mode.regimeWaves);
+      this.regimeBoundaries.push(this.queue[0]?.seq ?? this.nextSeq);
+      this.lastEvents.push({ kind: 'regime' });
       for (const q of this.queue) {
         if (q.cor !== 'GRAY') q.cor = colorFor(this.regime, q.seq, q.porta);
       }

@@ -135,6 +135,31 @@ describe('partida', () => {
     expect(game.integrity).toBeLessThan(MAX_INTEGRITY);
   });
 
+  it('publica os eventos do turno e marca onde cada regime começa', () => {
+    const game = new Game(21);
+    const kinds = new Set<string>();
+    let deliveries = 0;
+    for (let i = 0; i < 200 && game.regimeBoundaries.length === 0; i++) {
+      game.endTurn();
+      for (const e of game.lastEvents) {
+        kinds.add(e.kind);
+        if (e.kind === 'entrega') {
+          deliveries++;
+          expect(e.outcome).toBe(game.delivered.find((d) => d.seq === e.seq)?.outcome);
+        }
+      }
+    }
+    expect(deliveries).toBe(game.totals.acertos + game.totals.erros + game.totals.perdidos);
+    expect(kinds.has('regime')).toBe(true);
+    const boundary = game.regimeBoundaries[0];
+    // Da fronteira em diante, os pulsos seguem a regra nova: a fila inteira já está nela.
+    expect(boundary).toBeGreaterThan(0);
+    expect(game.queue.every((q) => q.seq >= boundary)).toBe(true);
+    for (const q of game.queue) {
+      if (q.cor !== 'GRAY') expect(q.cor).toBe(colorFor(game.regime, q.seq, q.porta));
+    }
+  });
+
   it('o script da bagagem já classifica o primeiro pulso da partida', () => {
     const game = new Game(11, undefined, 'box classificar(p, hist):\n    return TERRA');
     expect(game.pulses.length).toBeGreaterThan(0);

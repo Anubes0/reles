@@ -10,17 +10,25 @@ export const PULSE_FILL: Record<PulseColor, string> = {
 };
 
 export const BOARD = {
-  background: '#0d1117',
-  cell: '#131a24',
-  decisionBand: 'rgba(96, 165, 250, 0.06)',
-  wire: '#2a3547',
-  text: '#d8dee9',
-  textMuted: '#7d889a',
-  veiledFill: '#1a2130',
+  background: '#070b10',
+  panel: '#0e141c',
+  decisionBand: 'rgba(96, 165, 250, 0.05)',
+  decisionEdge: 'rgba(96, 165, 250, 0.25)',
+  gridDot: '#1c2634',
+  trace: '#223044',
+  pad: '#0b1118',
+  pin: '#3a4a60',
+  text: '#dbe3ee',
+  textMuted: '#7a8699',
+  veiledFill: '#121a26',
   veiledStroke: '#a3adbf',
   selection: '#ffffff',
   warning: '#fb923c',
-  inactive: '#3a4354',
+  inactive: '#2e3a4b',
+  good: '#4ade80',
+  bad: '#ff6b6b',
+  regime: '#c084fc',
+  accent: '#60a5fa',
 } as const;
 
-export const FONT_MONO = "ui-monospace, 'Cascadia Code', 'JetBrains Mono', Consolas, monospace";
+export const FONT_MONO = "'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, monospace";
