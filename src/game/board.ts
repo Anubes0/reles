@@ -180,6 +180,47 @@ export class Grid {
     return exits;
   }
 
+  /**
+   * Passos até sair pela linha `exitRow`, partindo da casa dada e seguindo só fios inteiros
+   * (sensor `dist`). `null` se não houver caminho.
+   */
+  distanceToExit(row: number, col: number, exitRow: number): number | null {
+    const dist = new Map<string, number>([[cellKey(row, col), 0]]);
+    const queue: Cell[] = [{ row, col }];
+    while (queue.length > 0) {
+      const cell = queue.shift()!;
+      const d = dist.get(cellKey(cell.row, cell.col))!;
+      const dirs: Dir[] = this.isRelay(cell.row, cell.col) ? this.validDirs(cell.row, cell.col) : ['LESTE'];
+      for (const dirTo of dirs) {
+        const next = this.step(cell.row, cell.col, dirTo);
+        if (next.col >= COLS) {
+          if (cell.row === exitRow) return d + 1;
+          continue;
+        }
+        const key = cellKey(next.row, next.col);
+        if (dist.has(key)) continue;
+        dist.set(key, d + 1);
+        queue.push(next);
+      }
+    }
+    return null;
+  }
+
+  /** Relés alcançáveis com um movimento a partir deste (sensor `vizinhos`). */
+  neighborRelays(row: number, col: number): (Cell & { via: Dir })[] {
+    const i = RELAY_COLS.indexOf(col as (typeof RELAY_COLS)[number]);
+    if (i === -1) return [];
+    const out: (Cell & { via: Dir })[] = [];
+    for (const d of this.validDirs(row, col)) {
+      if (d === 'LESTE') {
+        if (col !== LAST_RELAY_COL) out.push({ row, col: RELAY_COLS[i + 1], via: d });
+      } else {
+        out.push({ ...this.step(row, col, d), via: d });
+      }
+    }
+    return out;
+  }
+
   /** Toda porta ativa alcança toda saída ativa, e nenhum relé fica sem saída. */
   isPlayable(activePortRows: number[], activeExitRows: number[]): boolean {
     for (let row = 0; row < ROWS; row++) {

@@ -5,7 +5,8 @@ import { COLS, generateLayout, Grid, LAST_RELAY_COL, RELAY_COLS, ROWS, TERRA_ROW
 import { runBench, verifyRouter } from '../src/game/bench';
 import { classify, compileFor } from '../src/game/boxes';
 import { Game, MAX_INTEGRITY } from '../src/game/engine';
-import { levelParams, nextLevel } from '../src/game/mode';
+import { levelParams, MODES, nextLevel } from '../src/game/mode';
+import { TimeBank } from '../src/game/timebank';
 import { colorFor, generateRule, KEY_VALUES, type Key, type Rule } from '../src/game/pattern';
 import type { Pulse, PulseView } from '../src/game/types';
 import { DEFAULT_SCRIPTS } from '../src/ui/defaults';
@@ -101,6 +102,7 @@ function inject(game: Game, over: Partial<Pulse>): Pulse {
     held: false,
     stalled: false,
     heading: 'LESTE',
+    sintonizado: false,
     ...over,
   };
   game.pulses.push(pulse);
@@ -403,6 +405,51 @@ describe('partida', () => {
   });
 });
 
+// ---- Partida salva ----
+
+describe('partida salva', () => {
+  it('o diário refaz a partida igual: ações, scripts, pesquisa e turnos', () => {
+    const game = new Game(77, MODES.medio, { rotear: ORACLE_ROUTER }, ['memoria', 'aprender']);
+    expect(game.installScript('aprender', 'box ao_entregar(p, ok):\n    mem[0] = [p.cor, ok]').ok).toBe(true);
+    for (let i = 0; i < 120 && !game.over; i++) {
+      if (i === 30) game.unlock('prever');
+      if (i === 31) game.installScript('prever', 'box prever(hist):\n    return RED');
+      if (i === 60) game.removeScript('aprender');
+      if (i % 20 === 0) game.installScript('classificar', ruleToDsl(game.rule));
+      const pulse = game.pulses.find((p) => p.col <= LAST_RELAY_COL && p.dest);
+      if (pulse && i % 3 === 0) game.assign(pulse.id, pulse.dest!);
+      if (pulse && i % 7 === 0) game.hold(pulse.id);
+      if (i % 5 === 0) game.rotateRelay(TERRA_ROW - 2, RELAY_COLS[0], 1);
+      game.endTurn();
+    }
+    const kinds = new Set(game.journal.map((cmd) => cmd.c));
+    expect([...kinds].sort()).toEqual(['aplicar', 'destino', 'girar', 'liberar', 'remover', 'segurar', 'turno']);
+    const saved = JSON.parse(JSON.stringify({ start: game.start, journal: game.journal }));
+    const copy = Game.replay(saved.start, saved.journal)!;
+    expect(copy).not.toBeNull();
+    expect(copy.summary()).toEqual(game.summary());
+    expect(copy.integrity).toBe(game.integrity);
+    expect(copy.pulses).toEqual(game.pulses);
+    expect(copy.queue).toEqual(game.queue);
+    expect(copy.log).toEqual(game.log);
+    expect(copy.mem).toEqual(game.mem);
+    expect(copy.journal).toEqual(game.journal);
+    expect(Object.keys(copy.scripts).sort()).toEqual(Object.keys(game.scripts).sort());
+  });
+
+  it('turnos seguidos viram um só comando no diário', () => {
+    const game = new Game(5);
+    for (let i = 0; i < 30; i++) game.endTurn();
+    expect(game.journal).toEqual([{ c: 'turno', n: 30 }]);
+  });
+
+  it('um diário que não se repete (outra versão do jogo) não é retomado', () => {
+    const game = new Game(5);
+    game.endTurn();
+    expect(Game.replay(game.start, [...game.journal, { c: 'segurar', id: 9999 }])).toBeNull();
+  });
+});
+
 // ---- Bancada ----
 
 describe('bancada', () => {
@@ -425,6 +472,18 @@ describe('bancada', () => {
     if (result.ok) expect(result.passed).toBe(result.checks.length);
   });
 
+  it('a bancada roda com uma cópia do mem, listas internas inclusive', () => {
+    const game = new Game(9, undefined, {}, ['memoria']);
+    game.integrity = 1_000_000;
+    while (game.delivered.length === 0) game.endTurn();
+    game.mem![0] = [1, 2];
+    const source = 'box classificar(p, hist):\n    let l = mem[0]\n    l[0] = 99\n    mem[1] = 5\n    return MANUAL';
+    const result = runBench(source, game.delivered, game.entered, { features: game.features, mem: game.mem });
+    expect(result.ok).toBe(true);
+    expect(game.mem![0]).toEqual([1, 2]);
+    expect(game.mem![1]).toBeNull();
+  });
+
   it('aponta rotas que falham com fios rompidos', () => {
     const grid = new Grid(generateLayout(new Rng(5)));
     const ports = grid.layout.portRows;
@@ -433,5 +492,130 @@ describe('bancada', () => {
     const result = verifyRouter(naive, grid, [1, 2, 3], COLORS, 60);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.passed).toBeLessThan(result.checks.length);
+  });
+});
+
+// ---- Modos, caixas novas e progressão ----
+
+describe('modos', () => {
+  it('o médio e o difícil velam mais e já começam com regras compostas', () => {
+    expect(levelParams(0, MODES.facil).veiledChance).toBeCloseTo(0.25);
+    expect(levelParams(0, MODES.medio).veiledChance).toBeCloseTo(0.45);
+    expect(levelParams(10, MODES.dificil).veiledChance).toBeCloseTo(0.9);
+    expect(levelParams(0, MODES.facil)).toMatchObject({ minMods: 0, maxMods: 0, keys: ['porta'] });
+    expect(levelParams(0, MODES.dificil)).toMatchObject({ minMods: 2, keys: ['porta', 'carga', 'forma'] });
+  });
+
+  it('no difícil a regra tem pelo menos dois modificadores', () => {
+    const game = new Game(31, MODES.dificil);
+    expect(game.rule.mods.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('só o fácil anuncia a mudança de regime no registro', () => {
+    for (const mode of [MODES.facil, MODES.dificil]) {
+      const game = new Game(21, mode);
+      game.integrity = 1_000_000;
+      let regimes = 0;
+      for (let i = 0; i < 200 && regimes === 0; i++) {
+        game.endTurn();
+        regimes += game.lastEvents.filter((e) => e.kind === 'regime').length;
+      }
+      expect(regimes).toBeGreaterThan(0);
+      expect(game.log.some((l) => l.kind === 'regime')).toBe(mode.id === 'facil');
+    }
+  });
+
+  it('no médio, as saídas apagam sem entregas recentes e acendem de novo quando recebem um pulso', () => {
+    const game = new Game(5, MODES.medio);
+    game.pulses = [];
+    game.queue = [];
+    const red = game.grid.layout.outputs.find((o) => o.cor === 'RED')!.row;
+    expect(game.outputVisible(red)).toBe(true);
+    for (let i = 0; i < MODES.medio.outputFade!; i++) game.endTurn();
+    expect(game.outputVisible(red)).toBe(false);
+    expect(game.outputVisible(TERRA_ROW)).toBe(true);
+    inject(game, { row: red, col: COLS - 1, cor: 'RED' });
+    game.endTurn();
+    expect(game.outputVisible(red)).toBe(true);
+  });
+});
+
+describe('pesquisa e caixas novas', () => {
+  it('caixas bloqueadas não podem ser instaladas até a pesquisa', () => {
+    const game = new Game(1);
+    expect(game.installScript('prever', 'box prever(hist):\n    return None').ok).toBe(false);
+    game.unlock('prever');
+    expect(game.installScript('prever', 'box prever(hist):\n    return None').ok).toBe(true);
+  });
+
+  it('Previsor: acertar a cor do próximo pulso sintoniza e dobra os pontos', () => {
+    const game = new Game(12, undefined, {}, ['prever']);
+    game.installScript('prever', 'box prever(hist):\n    return RED');
+    const spawned: Pulse[] = [];
+    for (let i = 0; i < 60; i++) {
+      game.endTurn();
+      for (const p of game.pulses) if (!spawned.includes(p)) spawned.push(p);
+    }
+    expect(game.predictions.feitas).toBeGreaterThan(0);
+    for (const p of spawned) if (p.sintonizado) expect(p.cor).toBe('RED');
+    const tuned = spawned.filter((p) => p.sintonizado).length;
+    expect(game.predictions.acertos).toBe(tuned);
+    const events = game.log.filter((l) => l.text.includes('sintonizado'));
+    expect(game.predictions.acertos === 0 || events.length > 0).toBe(true);
+  });
+
+  it('Vigia: um ALERTA vira evento do turno e entra no registro', () => {
+    const game = new Game(4, undefined, {}, ['vigiar']);
+    game.installScript('vigiar', 'box vigiar(evento, hist):\n    if not evento.ok: return ALERTA\n    return None');
+    let alerted = false;
+    for (let i = 0; i < 80 && !alerted && !game.over; i++) {
+      game.endTurn();
+      alerted = game.lastEvents.some((e) => e.kind === 'alerta');
+    }
+    expect(alerted).toBe(true);
+    expect(game.log.some((l) => l.kind === 'alerta')).toBe(true);
+  });
+
+  it('Aprendiz e Memória: o que o Aprendiz grava o Classificador lê, e cada posição usada custa energia', () => {
+    const game = new Game(6, undefined, {}, ['memoria', 'aprender']);
+    game.installScript('aprender', 'box ao_entregar(p, ok):\n    mem[0] = (mem[0] ?? 0) + 1\n    mem[1] = p.cor');
+    game.integrity = 1_000_000; // sem Roteador os pulsos erram de saída: só queremos ver o Aprendiz
+    let delivered = 0;
+    for (let i = 0; i < 60; i++) {
+      game.endTurn();
+      delivered += game.lastEvents.filter((e) => e.kind === 'entrega').length;
+    }
+    expect(delivered).toBeGreaterThan(0);
+    expect(game.mem![0]).toBe(delivered);
+    expect(game.memUsed).toBe(2);
+    game.endTurn();
+    // 1 por caixa instalada + 2 por posição ocupada, antes de qualquer chamada do turno.
+    expect(game.energyUsed).toBeGreaterThanOrEqual(1 + 2 * 2);
+  });
+
+  it('eficiência: com scripts e entregas certas, a onda rende pontos extras', () => {
+    const game = new Game(42, undefined, { rotear: ORACLE_ROUTER });
+    game.installScript('classificar', ruleToDsl(game.rule));
+    for (let i = 0; i < 45; i++) game.endTurn();
+    expect(game.efficiencyPoints).toBeGreaterThan(0);
+    expect(game.log.some((l) => l.text.startsWith('Eficiência da onda'))).toBe(true);
+  });
+});
+
+describe('banco de tempo', () => {
+  it('gasta, zera, passa para o automático e volta depois de recarregar', () => {
+    const bank = new TimeBank({ startMs: 10_000, maxMs: 10_000, rechargeMs: 3000, resumeMs: 6000 });
+    expect(bank.spend(4000)).toBe(false);
+    expect(bank.remainingMs).toBe(6000);
+    expect(bank.spend(9000)).toBe(true);
+    expect(bank.auto).toBe(true);
+    bank.turnEnded();
+    expect(bank.auto).toBe(true);
+    bank.turnEnded();
+    expect(bank.remainingMs).toBe(6000);
+    expect(bank.auto).toBe(false);
+    bank.turnEnded();
+    bank.turnEnded();
+    expect(bank.remainingMs).toBe(10_000);
   });
 });

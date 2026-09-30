@@ -1,19 +1,25 @@
-import type { BinaryOp, BoxDef, Expr, Pos, Stmt } from './ast';
-import { DslError, lockedMessage } from './errors';
+import type { BinaryOp, BoxDef, Expr, MatchCase, Pos, Stmt } from './ast';
+import { DslError, lockedMessage, NO_FEATURES, type Features } from './errors';
 import { tokenize, type Token } from './lexer';
 
 const COMPARISON_OPS = new Set(['==', '!=', '<', '<=', '>', '>=']);
 
-/** Lê o código de uma caixa: exatamente um `box nome(params):` com corpo indentado. */
-export function parseBox(source: string): BoxDef {
-  return new Parser(tokenize(source)).parseProgram();
+/**
+ * Lê o código de uma caixa: exatamente um `box nome(params):` com corpo indentado.
+ * `features` diz quais construções bloqueáveis (`=>`, `match`) já foram liberadas.
+ */
+export function parseBox(source: string, features: Features = NO_FEATURES): BoxDef {
+  return new Parser(tokenize(source), features).parseProgram();
 }
 
 class Parser {
   private pos = 0;
   private loopDepth = 0;
 
-  constructor(private readonly tokens: Token[]) {}
+  constructor(
+    private readonly tokens: Token[],
+    private readonly features: Features,
+  ) {}
 
   parseProgram(): BoxDef {
     if (this.peek().type === 'eof') throw this.error('o script está vazio: escreva um "box"', this.peek());
@@ -67,7 +73,11 @@ class Parser {
     if (this.isKeyword('if')) return this.parseIf();
     if (this.isKeyword('for')) return this.parseFor();
     const tok = this.peek();
-    if (this.isKeyword('match')) throw this.error(lockedMessage('casamento'), tok);
+    if (this.isKeyword('match')) {
+      if (!this.features.casamento) throw this.error(lockedMessage('casamento'), tok);
+      return this.parseMatch();
+    }
+    if (this.isKeyword('case')) throw this.error('"case" sem "match" antes', tok);
     if (this.isKeyword('while')) throw this.error('"while" é proibido: use "for" sobre uma lista ou range()', tok);
     if (this.isKeyword('elif') || this.isKeyword('else')) throw this.error(`"${tok.value}" sem "if" antes`, tok);
     if (this.peek().type === 'indent') throw this.error('indentação inesperada', tok);
@@ -108,7 +118,13 @@ class Parser {
       return { kind: 'assign', name: tok.value, value: this.parseExpression(), ...pos };
     }
     const expr = this.parseExpression();
-    if (this.isOp('=')) throw this.error('só é possível atribuir a uma variável', this.peek());
+    if (this.isOp('=')) {
+      if (expr.kind === 'index' && expr.object.kind === 'name') {
+        this.advance();
+        return { kind: 'assignIndex', name: expr.object.name, index: expr.index, value: this.parseExpression(), ...pos };
+      }
+      throw this.error('só é possível atribuir a uma variável ou a uma posição de lista (lista[i] = ...)', this.peek());
+    }
     throw this.error('expressão solta não faz nada: use "return" ou "let"', { line: expr.line, col: expr.col });
   }
 
@@ -146,6 +162,37 @@ class Parser {
     } finally {
       this.loopDepth--;
     }
+  }
+
+  /** `match valor:` seguido de `case A, B:` (qualquer um deles) e `case _:` (qualquer outro). */
+  private parseMatch(): Stmt {
+    const start = this.advance();
+    const subject = this.parseExpression();
+    this.expectOp(':');
+    if (this.peek().type !== 'newline') throw this.error('os "case" do "match" vêm nas linhas de baixo', this.peek());
+    this.advance();
+    if (this.peek().type !== 'indent') throw this.error('esperado um bloco indentado com "case"', this.peek());
+    this.advance();
+    const cases: MatchCase[] = [];
+    while (this.peek().type !== 'dedent' && this.peek().type !== 'eof') {
+      const tok = this.peek();
+      if (!this.isKeyword('case')) throw this.error('dentro de "match" só entram linhas "case"', tok);
+      this.advance();
+      let patterns: Expr[] | null = [];
+      if (this.peek().type === 'name' && this.peek().value === '_' && this.peekAt(1).value === ':') {
+        this.advance();
+        patterns = null;
+      } else {
+        do {
+          patterns.push(this.parseExpression());
+        } while (this.matchOp(','));
+      }
+      this.expectOp(':');
+      cases.push({ patterns, body: this.parseBlock(), line: tok.line, col: tok.col });
+    }
+    if (this.peek().type === 'dedent') this.advance();
+    if (cases.length === 0) throw this.error('"match" precisa de pelo menos um "case"', start);
+    return { kind: 'match', subject, cases, line: start.line, col: start.col };
   }
 
   // ---- Expressões, da menor para a maior precedência ----
@@ -269,7 +316,11 @@ class Parser {
     }
     if (tok.type === 'name') {
       this.advance();
-      if (this.isOp('=>')) throw this.error(`"=>": ${lockedMessage('funcional')}`, this.peek());
+      if (this.isOp('=>')) {
+        if (!this.features.funcional) throw this.error(`"=>": ${lockedMessage('funcional')}`, this.peek());
+        this.advance();
+        return { kind: 'lambda', param: tok.value, body: this.parseExpression(), ...pos };
+      }
       return { kind: 'name', name: tok.value, ...pos };
     }
     if (tok.type === 'keyword') {

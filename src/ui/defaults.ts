@@ -24,4 +24,26 @@ box rotear(j, p, destino):
         return LESTE
     return MANTER
 `,
+  prever: `# Previsor: aposta na cor do PRÓXIMO pulso, olhando só o histórico.
+# Se acertar, o pulso entra sintonizado e vale o dobro. Retorne uma cor ou None.
+box prever(hist):
+    if len(hist) == 0:
+        return None
+    # Ex.: se as cores seguem um ciclo pelo seq:
+    # return [RED, BLUE][(hist[-1].seq + 1) % 2]
+    return None
+`,
+  vigiar: `# Vigia: recebe cada evento (ENTREGA, COLISAO ou QUEIMOU) e pode dar ALERTA,
+# que pausa o jogo para você olhar. Retorne ALERTA ou None.
+box vigiar(evento, hist):
+    if evento.tipo == ENTREGA and not evento.ok:
+        return ALERTA         # entrega errada: a regra pode ter mudado
+    return None
+`,
+  aprender: `# Aprendiz: roda a cada pulso que sai, já com a cor revelada.
+# Não retorna nada: grave no mem o que as outras caixas precisam lembrar.
+box ao_entregar(p, ok):
+    if ok:
+        mem[0] = p.cor        # a última cor que acertamos
+`,
 };

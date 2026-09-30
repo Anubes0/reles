@@ -1,39 +1,66 @@
 import { COLOR_LABEL } from '../core/colors';
 import { LAST_RELAY_COL } from '../game/board';
 import { formatDecision, runBench, verifyRouter, type BenchResult, type RouteBenchResult } from '../game/bench';
-import type { BoxId } from '../game/boxes';
+import { BOX_IDS, BOX_INFO, type BoxId } from '../game/boxes';
 import { BOX_LABEL, Game, MAX_INTEGRITY } from '../game/engine';
-import { FACIL } from '../game/mode';
+import { MODE_IDS, MODES, type ModeId } from '../game/mode';
+import { researchPointsFor, RESEARCH, type ResearchId } from '../game/research';
+import { TimeBank } from '../game/timebank';
 import type { Destination } from '../game/types';
-import { byId, el } from './dom';
 import { DEFAULT_SCRIPTS } from './defaults';
+import { helpContent, historyContent, modeContent, overContent, pauseContent, researchContent, type PauseNote } from './dialogs';
+import { byId, el } from './dom';
 import { CodeEditor } from './editor';
 import { BoardRenderer, destLabel, outputSlots } from './render';
-import { storage, type Baggage } from './storage';
+import { storage, type SavedMatch } from './storage';
 import { PULSE_FILL } from './theme';
 import { PatternTimeline, timelineItems, type RowKey } from './timeline';
 
-
-const BOXES: BoxId[] = ['classificar', 'rotear'];
 const BENCH_SIZE = 20;
+const AUTO_TURN_MS = 650;
+const BANK_TICK_MS = 100;
+/** Turnos que o ícone de regime pisca no médio (aviso sutil). */
+const REGIME_ICON_TURNS = 3;
 const DEFAULT_HINT = 'Clique num pulso (ou Tab) e escolha a saída (clique ou 1–9, 0, T). Clique num relé para girá-lo.';
 
-type Dialog = 'help' | 'pause' | 'over' | 'abandon' | null;
+const BOX_HELP: Record<BoxId, string> = {
+  classificar: 'decide o destino de cada pulso que entra',
+  rotear: 'decide a seta de um relé quando há pulso nele',
+  prever: 'aposta na cor do próximo pulso; acertou, ele vale o dobro',
+  vigiar: 'recebe cada evento e pode dar ALERTA, que pausa o jogo',
+  aprender: 'recebe cada pulso que sai, com a cor real, e grava no mem',
+};
+
+type Dialog = 'help' | 'pause' | 'over' | 'mode' | 'research' | 'history' | null;
 type Tab = 'signals' | 'log' | 'bench' | 'ref';
 
 export class App {
+  private mode: ModeId;
   private game: Game;
+  private bank: TimeBank | null = null;
   private selectedId: number | null = null;
   private dialog: Dialog = null;
   private box: BoxId = 'classificar';
-  private readonly drafts: Record<BoxId, string>;
+  private drafts: Record<BoxId, string>;
   private readonly renderer: BoardRenderer;
   private readonly editor: CodeEditor;
   private readonly timeline: PatternTimeline;
   private saveTimer = 0;
+  private matchTimer = 0;
+  private autoTimer = 0;
+  private lastTick = performance.now();
+  private turnStartedAt = performance.now();
+  private turnTime = { total: 0, count: 0 };
+  private regimeIconTurns = 0;
   private shown = { score: 0, integrity: MAX_INTEGRITY };
 
   private readonly ui = {
+    mode: byId('hud-mode'),
+    regime: byId('hud-regime'),
+    bank: byId('hud-bank'),
+    bankValue: byId('hud-bank-value'),
+    bankFill: byId('hud-bank-fill'),
+    pp: byId('hud-pp'),
     turn: byId('hud-turn'),
     wave: byId('hud-wave'),
     waveFill: byId('hud-wave-fill'),
@@ -44,23 +71,29 @@ export class App {
     queue: byId('queue'),
     boardStats: byId('board-stats'),
     actions: byId('actions'),
+    energyMeter: byId('energy-meter'),
     energyFill: byId('energy-fill'),
     energyValue: byId('energy-value'),
+    autoBadge: byId('auto-badge'),
     hint: byId('hint'),
+    signature: byId('box-signature'),
     bench: byId('bench'),
     log: byId('log'),
     overlay: byId('overlay'),
     dialog: byId('dialog'),
     canvas: byId<HTMLCanvasElement>('board'),
     hold: byId<HTMLButtonElement>('btn-hold'),
+    end: byId<HTMLButtonElement>('btn-end'),
+    test: byId<HTMLButtonElement>('btn-test'),
+    apply: byId<HTMLButtonElement>('btn-apply'),
   };
 
   constructor() {
-    this.game = this.newGame();
-    this.drafts = {
-      classificar: storage.script('classificar') ?? this.game.scripts.classificar?.source ?? DEFAULT_SCRIPTS.classificar,
-      rotear: storage.script('rotear') ?? this.game.scripts.rotear?.source ?? DEFAULT_SCRIPTS.rotear,
-    };
+    const saved = storage.match();
+    const resumed = saved ? this.resume(saved) : null;
+    this.mode = resumed?.start.mode ?? storage.lastMode();
+    this.game = resumed ?? this.newGame(this.mode);
+    this.drafts = this.loadDrafts();
     this.renderer = new BoardRenderer(this.ui.canvas, () => ({ game: this.game, selectedId: this.selectedId }));
     this.timeline = new PatternTimeline(byId('timeline'));
     this.editor = new CodeEditor(
@@ -77,16 +110,19 @@ export class App {
         onTest: () => this.testScript(),
       },
     );
+    this.editor.features = this.game.features;
     this.editor.load(this.box, this.drafts[this.box]);
 
-    byId('btn-end').addEventListener('click', () => this.endTurn());
-    byId('btn-apply').addEventListener('click', () => this.applyScript());
-    byId('btn-test').addEventListener('click', () => this.testScript());
+    this.ui.end.addEventListener('click', () => this.endTurn());
+    this.ui.apply.addEventListener('click', () => this.applyScript());
+    this.ui.test.addEventListener('click', () => this.testScript());
     byId('btn-remove').addEventListener('click', () => this.removeScript());
-    byId('btn-new').addEventListener('click', () => this.requestNewGame());
+    byId('btn-new').addEventListener('click', () => this.openDialog('mode'));
     byId('btn-help').addEventListener('click', () => this.openDialog('help'));
+    byId('btn-research').addEventListener('click', () => this.openDialog('research'));
+    byId('btn-history').addEventListener('click', () => this.openDialog('history'));
     this.ui.hold.addEventListener('click', () => this.holdSelected());
-    for (const box of BOXES) byId(`box-${box}`).addEventListener('click', () => this.switchBox(box));
+    for (const box of BOX_IDS) byId(`box-${box}`).addEventListener('click', () => this.switchBox(box));
     for (const tab of ['signals', 'log', 'bench', 'ref'] as const) {
       byId(`tab-${tab}`).addEventListener('click', () => this.showTab(tab));
     }
@@ -102,84 +138,274 @@ export class App {
       this.onCanvasClick(e, -1);
     });
     document.addEventListener('keydown', (e) => this.onKeyDown(e));
+    // Trocar de janela pausa o jogo nos modos com banco de tempo (sem penalidade).
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'hidden') return;
+      this.autoPause();
+      this.persist();
+    });
+    window.addEventListener('blur', () => this.autoPause());
+    // Fechar ou recarregar a aba não perde a partida: ela é salva e retomada.
+    window.addEventListener('pagehide', () => this.persist());
+    window.setInterval(() => this.tickBank(), BANK_TICK_MS);
 
     this.setHint('');
     this.refresh();
+    if (resumed) this.announceResume();
+    else if (saved) this.setHint('A partida salva não pôde ser retomada nesta versão do jogo; ela entrou no histórico como abandonada.', true);
     if (!storage.helpSeen()) this.openDialog('help');
   }
 
   // ---- Partida ----
 
-  private newGame(): Game {
+  private newGame(mode: ModeId): Game {
     const seed = (Date.now() ^ (Math.random() * 0x7fffffff)) >>> 0;
-    const game = new Game(seed, FACIL, storage.baggage(FACIL.id));
+    const config = MODES[mode];
+    const game = new Game(seed, config, storage.baggage(mode), storage.unlocked(mode));
+    this.bank = config.timeBank ? new TimeBank(config.timeBank) : null;
+    this.stopAuto();
+    this.turnStartedAt = performance.now();
+    this.turnTime = { total: 0, count: 0 };
+    this.regimeIconTurns = 0;
     this.shown = { score: 0, integrity: game.integrity };
     return game;
   }
 
-  private startNewGame(): void {
-    this.game = this.newGame();
+  /**
+   * Refaz a partida salva comando a comando e confere o resultado. Se não bater
+   * (uma versão nova do jogo mudou as regras), ela conta como abandonada.
+   */
+  private resume(saved: SavedMatch): Game | null {
+    try {
+      const game = Game.replay(saved.start, saved.journal);
+      const c = saved.check;
+      if (!game || game.over || game.turn !== c.turn || game.score !== c.score || game.integrity !== c.integrity) {
+        storage.clearMatch();
+        if (!game?.over) {
+          storage.finishMatch(saved.start.mode, {
+            score: c.score,
+            turns: c.turn,
+            precision: c.precision,
+            abandoned: true,
+            date: new Date().toISOString(),
+            maxLevel: c.maxLevel,
+            regimes: c.regimes,
+            avgTurnSeconds: saved.turnTime.count ? saved.turnTime.total / saved.turnTime.count : undefined,
+          });
+        }
+        return null;
+      }
+      const bank = MODES[saved.start.mode].timeBank;
+      this.bank = bank ? new TimeBank(bank) : null;
+      if (this.bank && saved.bank) {
+        this.bank.remainingMs = saved.bank.remainingMs;
+        this.bank.auto = saved.bank.auto;
+      }
+      this.turnTime = { ...saved.turnTime };
+      this.shown = { score: game.score, integrity: game.integrity };
+      return game;
+    } catch {
+      // Dado salvo ilegível: não há o que retomar nem o que registrar.
+      storage.clearMatch();
+      return null;
+    }
+  }
+
+  /** Nos modos com banco, a partida retomada começa pausada: o tempo só corre quando você volta. */
+  private announceResume(): void {
+    const text = `Partida do ${MODES[this.mode].label.toLowerCase()} retomada no turno ${this.game.turn}.`;
+    if (!this.bank) {
+      this.setHint(text);
+      return;
+    }
+    if (this.bank.auto) this.startAuto();
+    this.openDialog('pause', { title: 'Partida retomada', text });
+  }
+
+  /** Salva a partida ativa logo depois de cada mudança (sem gravar a cada clique). */
+  private persistSoon(): void {
+    window.clearTimeout(this.matchTimer);
+    this.matchTimer = window.setTimeout(() => this.persist(), 300);
+  }
+
+  private persist(): void {
+    window.clearTimeout(this.matchTimer);
+    const g = this.game;
+    if (g.over) return;
+    const s = g.summary();
+    storage.saveMatch({
+      start: g.start,
+      journal: g.journal,
+      check: { turn: g.turn, score: g.score, integrity: g.integrity, precision: s.precision, maxLevel: s.maxLevel, regimes: s.regimes.length },
+      bank: this.bank ? { remainingMs: this.bank.remainingMs, auto: this.bank.auto } : null,
+      turnTime: this.turnTime,
+    });
+  }
+
+  private loadDrafts(): Record<BoxId, string> {
+    return Object.fromEntries(
+      BOX_IDS.map((box) => [box, storage.script(this.mode, box) ?? this.game.scripts[box]?.source ?? DEFAULT_SCRIPTS[box]]),
+    ) as Record<BoxId, string>;
+  }
+
+  private startNewGame(mode: ModeId): void {
+    this.mode = mode;
+    storage.saveLastMode(mode);
+    this.game = this.newGame(mode);
+    this.drafts = this.loadDrafts();
+    this.editor.features = this.game.features;
+    if (!this.game.isBoxAvailable(this.box)) this.box = 'classificar';
+    this.editor.load(this.box, this.drafts[this.box]);
     this.selectedId = null;
     this.renderer.clearEffects();
     this.closeDialog();
-    const carried = BOXES.filter((b) => this.game.scripts[b]).map((b) => BOX_LABEL[b]);
-    this.setHint(carried.length ? `Nova partida: ${carried.join(' e ')} vieram na bagagem.` : 'Nova partida.');
+    const carried = BOX_IDS.filter((b) => this.game.scripts[b]).map((b) => BOX_LABEL[b]);
+    this.setHint(
+      carried.length
+        ? `Nova partida no ${MODES[mode].label.toLowerCase()}: ${carried.join(', ')} ${carried.length > 1 ? 'vieram' : 'veio'} na bagagem.`
+        : `Nova partida no ${MODES[mode].label.toLowerCase()}.`,
+    );
     this.refresh();
   }
 
-  private requestNewGame(): void {
-    const inProgress = !this.game.over && (this.game.turn > 1 || this.game.delivered.length > 0);
-    if (inProgress) this.openDialog('abandon');
-    else this.startNewGame();
+  private inProgress(): boolean {
+    return !this.game.over && (this.game.turn > 1 || this.game.delivered.length > 0);
   }
 
-  private abandonAndRestart(): void {
+  /** Só existe uma partida por vez: começar outra abandona a atual. */
+  private abandonCurrent(): void {
+    if (!this.inProgress()) return;
     const s = this.game.summary();
-    storage.finishMatch(this.game.mode.id, {
+    storage.finishMatch(this.mode, {
       score: s.score,
       turns: s.turns,
       precision: s.precision,
       abandoned: true,
       date: new Date().toISOString(),
+      maxLevel: s.maxLevel,
+      regimes: s.regimes.length,
+      avgTurnSeconds: this.averageTurnSeconds(),
     });
-    this.startNewGame();
   }
 
-  private endTurn(): void {
-    if (this.game.over || this.dialog) return;
+  private endTurn(auto = false): void {
+    if (this.game.over) return;
+    if (!auto && (this.dialog || this.bank?.auto)) return;
+    if (auto && this.dialog) return;
+    const now = performance.now();
+    if (!auto) {
+      this.turnTime.total += (now - this.turnStartedAt) / 1000;
+      this.turnTime.count++;
+    }
+    this.turnStartedAt = now;
+
     const before = this.renderer.snapshot();
     this.game.endTurn();
     this.renderer.animateFrom(before);
-    this.renderer.playEvents(this.game.lastEvents);
+    this.renderer.playEvents(this.game.lastEvents, this.game.mode.regimeNotice === 'explicito');
+    this.bank?.turnEnded();
+    if (this.bank && !this.bank.auto) this.stopAuto();
+
+    if (this.game.lastEvents.some((e) => e.kind === 'regime') && this.game.mode.regimeNotice === 'sutil') {
+      this.regimeIconTurns = REGIME_ICON_TURNS;
+    } else if (this.regimeIconTurns > 0) {
+      this.regimeIconTurns--;
+    }
 
     const selected = this.game.pulses.find((p) => p.id === this.selectedId);
     if (!selected) this.selectedId = null;
-    this.setHint('');
+    if (!auto) this.setHint('');
 
     this.refresh();
-    if (this.game.over) window.setTimeout(() => this.finishGame(), 700);
+    const alert = this.game.lastEvents.find((e) => e.kind === 'alerta');
+    if (this.game.over) {
+      this.stopAuto();
+      const result = this.recordFinish();
+      window.setTimeout(() => this.openDialog('over', null, result), 700);
+    } else if (alert && alert.kind === 'alerta') {
+      window.setTimeout(() => this.openDialog('pause', { title: 'O Vigia disparou', text: alert.text }), 450);
+    }
   }
 
-  private finishGame(): void {
-    const s = this.game.summary();
-    const isRecord = storage.finishMatch(this.game.mode.id, {
+  /**
+   * Fim de partida: registra na hora (recorde, histórico e PP) e já deixa salva a bagagem
+   * padrão, a mesma que vem marcada na tela final, caso a aba feche antes da escolha.
+   */
+  private recordFinish(): { isRecord: boolean; pp: number } {
+    const g = this.game;
+    const s = g.summary();
+    const pp = researchPointsFor(s.score);
+    const isRecord = storage.finishMatch(this.mode, {
       score: s.score,
       turns: s.turns,
       precision: s.precision,
       abandoned: false,
       date: new Date().toISOString(),
+      maxLevel: s.maxLevel,
+      regimes: s.regimes.length,
+      avgTurnSeconds: this.averageTurnSeconds(),
+      pp,
     });
-    storage.saveBaggage(this.game.mode.id, this.baggageNow());
-    this.openDialog('over', isRecord);
+    storage.clearMatch();
+    const installed = BOX_IDS.filter((b) => g.scripts[b]).slice(0, g.mode.baggageLimit);
+    storage.saveBaggage(this.mode, Object.fromEntries(installed.map((b) => [b, g.scripts[b]!.source])));
+    return { isRecord, pp };
   }
 
-  private baggageNow(): Baggage {
-    return Object.fromEntries(BOXES.filter((b) => this.game.scripts[b]).map((b) => [b, this.game.scripts[b]!.source]));
+  /** Bagagem escolhida: segue o que foi marcado; o resto é apagado. */
+  private carryBaggage(carry: BoxId[]): void {
+    const baggage = Object.fromEntries(carry.map((b) => [b, this.game.scripts[b]!.source]));
+    storage.saveBaggage(this.mode, baggage);
+    for (const box of BOX_IDS) if (!carry.includes(box)) storage.eraseScript(this.mode, box);
+    this.openDialog('mode');
+  }
+
+  private averageTurnSeconds(): number | undefined {
+    const { total, count } = this.turnTime;
+    return count === 0 ? undefined : total / count;
+  }
+
+  // ---- Banco de tempo ----
+
+  private tickBank(): void {
+    const now = performance.now();
+    const elapsed = now - this.lastTick;
+    this.lastTick = now;
+    const bank = this.bank;
+    if (!bank || this.game.over || this.dialog || document.visibilityState !== 'visible' || bank.auto) return;
+    if (bank.spend(elapsed)) this.startAuto();
+    this.renderBank();
+  }
+
+  /** Banco zerado: os turnos passam sozinhos, só com os scripts, até ele recarregar. */
+  private startAuto(): void {
+    if (this.autoTimer) return;
+    this.setHint('O tempo acabou: os turnos passam sozinhos, só com os scripts, até o banco recarregar.', true);
+    this.autoTimer = window.setInterval(() => this.endTurn(true), AUTO_TURN_MS);
+    this.refresh();
+  }
+
+  private stopAuto(): void {
+    if (!this.autoTimer) return;
+    window.clearInterval(this.autoTimer);
+    this.autoTimer = 0;
+    this.setHint('O banco recarregou: é a sua vez de novo.');
+  }
+
+  private autoPause(): void {
+    if (this.bank && !this.dialog && !this.game.over) this.openDialog('pause');
   }
 
   // ---- Ações manuais ----
 
+  private manualBlocked(): boolean {
+    if (!this.bank?.auto) return false;
+    this.setHint('Sem ações manuais enquanto o banco de tempo recarrega.', true);
+    return true;
+  }
+
   private assignSelected(dest: Destination): void {
+    if (this.manualBlocked()) return;
     if (this.selectedId === null) {
       this.setHint('Selecione um pulso primeiro (clique nele ou use Tab).', true);
       return;
@@ -194,6 +420,7 @@ export class App {
   }
 
   private holdSelected(): void {
+    if (this.manualBlocked()) return;
     if (this.selectedId === null) {
       this.setHint('Selecione um pulso para segurar.', true);
       return;
@@ -204,6 +431,7 @@ export class App {
   }
 
   private rotate(row: number, col: number, step: 1 | -1): void {
+    if (this.manualBlocked()) return;
     const result = this.game.rotateRelay(row, col, step);
     if (!result.ok) {
       this.setHint(`Não foi possível: ${result.reason}.`, true);
@@ -234,57 +462,95 @@ export class App {
   // ---- Scripts ----
 
   private switchBox(box: BoxId): void {
+    if (!this.game.isBoxAvailable(box)) {
+      const item = RESEARCH.find((r) => r.id === BOX_INFO[box].research)!;
+      this.setHint(`${BOX_LABEL[box]} sai na Pesquisa por ${item.preco} PP.`, true);
+      this.openDialog('research');
+      return;
+    }
     if (box === this.box) return;
     this.drafts[this.box] = this.editor.value;
     this.box = box;
-    for (const b of BOXES) byId(`box-${b}`).setAttribute('aria-selected', String(b === box));
     this.editor.load(box, this.drafts[box]);
-    this.renderScriptStatus();
+    this.refresh();
   }
 
   private onEditorChange(source: string): void {
     this.drafts[this.box] = source;
-    const box = this.box;
+    const { box, mode } = this;
     window.clearTimeout(this.saveTimer);
-    this.saveTimer = window.setTimeout(() => storage.saveScript(box, source), 400);
+    this.saveTimer = window.setTimeout(() => storage.saveScript(mode, box, source), 400);
     this.renderScriptStatus();
   }
 
   private applyScript(): void {
+    if (this.game.mode.applyEndsTurn && this.manualBlocked()) return;
     const result = this.game.installScript(this.box, this.editor.value);
     if (!result.ok) {
       this.editor.showError(result.error.message, result.error.line, result.error.col);
       this.setHint('O script tem erro e não foi aplicado.', true);
       return;
     }
-    storage.saveBaggage(this.game.mode.id, this.baggageNow());
+    if (this.game.mode.applyEndsTurn) {
+      this.endTurn();
+      this.setHint(`${BOX_LABEL[this.box]} aplicado. No difícil, aplicar custa o turno.`);
+      return;
+    }
     this.setHint(`${BOX_LABEL[this.box]} aplicado.`);
     this.refresh();
   }
 
   private removeScript(): void {
     this.game.removeScript(this.box);
-    storage.saveBaggage(this.game.mode.id, this.baggageNow());
     this.refresh();
   }
 
   private testScript(): void {
+    const mode = this.game.mode;
+    if (mode.bench === 'nenhuma') {
+      this.setHint('No difícil não há bancada de testes: aplique e observe.', true);
+      return;
+    }
+    if (this.box !== 'classificar' && this.box !== 'rotear') {
+      this.showTab('bench');
+      this.ui.bench.replaceChildren(el('p', { class: 'empty' }, 'A bancada testa o Classificador e o Roteador. As outras caixas você acompanha pelo Registro.'));
+      return;
+    }
+    if (mode.bench === 'banco' && this.bank) {
+      if (this.bank.spend(mode.benchCostMs)) this.startAuto();
+      this.setHint(`A bancada custou ${mode.benchCostMs / 1000} s do banco de tempo.`);
+      this.renderBank();
+    }
     this.showTab('bench');
+    const g = this.game;
+    const ctx = { features: g.features, mem: g.mem };
     if (this.box === 'rotear') {
-      const g = this.game;
-      const result = verifyRouter(this.editor.value, g.grid, g.activePorts, g.params.palette, g.mode.pulseLifetime);
+      const result = verifyRouter(this.editor.value, g.grid, g.activePorts, g.params.palette, mode.pulseLifetime, ctx);
       if (!result.ok) this.editor.showError(result.message, result.line);
       this.renderRouteBench(result);
       return;
     }
-    const cases = this.game.delivered.slice(-BENCH_SIZE);
+    const cases = g.delivered.slice(-BENCH_SIZE);
     if (cases.length === 0) {
       this.ui.bench.replaceChildren(el('p', { class: 'empty' }, 'Ainda não há pulsos que saíram para testar. Jogue alguns turnos.'));
       return;
     }
-    const result = runBench(this.editor.value, cases, this.game.entered);
+    const result = runBench(this.editor.value, cases, g.entered, ctx);
     if (!result.ok) this.editor.showError(result.message, result.line);
     this.renderBench(result);
+  }
+
+  // ---- Pesquisa ----
+
+  private buy(id: ResearchId, price: number): void {
+    if (!storage.buy(this.mode, id, price)) return;
+    this.game.unlock(id);
+    this.editor.features = this.game.features;
+    this.editor.load(this.box, this.editor.value);
+    const item = RESEARCH.find((r) => r.id === id)!;
+    this.setHint(`${item.nome} liberado no ${MODES[this.mode].label.toLowerCase()}.`);
+    this.refresh();
+    this.openDialog('research');
   }
 
   // ---- Entrada ----
@@ -313,7 +579,9 @@ export class App {
 
   private onKeyDown(e: KeyboardEvent): void {
     if (this.dialog) {
-      if (e.key === 'Escape' && (this.dialog === 'pause' || this.dialog === 'help' || this.dialog === 'abandon')) {
+      // Com a partida encerrada, o fim e a escolha do modo só saem começando outra.
+      const closable = this.dialog !== 'over' && !(this.dialog === 'mode' && this.game.over);
+      if (e.key === 'Escape' && closable) {
         e.preventDefault();
         this.closeDialog();
       }
@@ -341,6 +609,8 @@ export class App {
       this.holdSelected();
     } else if (key === 'h') {
       this.openDialog('help');
+    } else if (key === 'p') {
+      this.openDialog('research');
     } else if (key === 'e') {
       e.preventDefault();
       this.editor.focus();
@@ -373,10 +643,57 @@ export class App {
 
   // ---- Diálogos ----
 
-  private openDialog(kind: Exclude<Dialog, null>, isRecord = false): void {
+  private openDialog(kind: Exclude<Dialog, null>, note: PauseNote | null = null, over?: { isRecord: boolean; pp: number }): void {
     this.dialog = kind;
     const d = this.ui.dialog;
-    d.replaceChildren(...this.dialogContent(kind, isRecord));
+    const close = () => this.closeDialog();
+    let content;
+    switch (kind) {
+      case 'help':
+        content = helpContent(close);
+        break;
+      case 'pause':
+        content = pauseContent(note, this.bank !== null, close);
+        break;
+      case 'mode': {
+        const info = Object.fromEntries(MODE_IDS.map((m) => [m, { record: storage.record(m), points: storage.points(m) }]));
+        content = modeContent(this.mode, this.inProgress(), info as never, (mode) => {
+          this.abandonCurrent();
+          this.startNewGame(mode);
+        }, this.game.over ? null : close);
+        break;
+      }
+      case 'research':
+        content = researchContent(this.mode, storage.points(this.mode), this.game.unlocked, (id, price) => this.buy(id, price), close);
+        break;
+      case 'history':
+        content = historyContent(this.mode, storage.history(this.mode), close);
+        break;
+      case 'over': {
+        const s = this.game.summary();
+        const installed = BOX_IDS.filter((b) => this.game.scripts[b]);
+        content = overContent(
+          this.mode,
+          {
+            score: s.score,
+            turns: s.turns,
+            precision: s.precision,
+            acertos: s.totals.acertos,
+            maxLevel: s.maxLevel,
+            regimes: s.regimes,
+            pp: over?.pp ?? 0,
+            efficiencyPoints: s.efficiencyPoints,
+            predictions: s.predictions,
+          },
+          over?.isRecord ?? false,
+          storage.record(this.mode),
+          installed,
+          (carry) => this.carryBaggage(carry),
+        );
+        break;
+      }
+    }
+    d.replaceChildren(...content.filter((n): n is Node | string => n !== null && n !== false));
     this.ui.overlay.hidden = false;
     d.querySelector<HTMLElement>('[data-autofocus]')?.focus();
   }
@@ -385,87 +702,8 @@ export class App {
     if (this.dialog === 'help') storage.markHelpSeen();
     this.dialog = null;
     this.ui.overlay.hidden = true;
+    this.lastTick = performance.now();
     (document.activeElement as HTMLElement | null)?.blur();
-  }
-
-  private dialogContent(kind: Exclude<Dialog, null>, isRecord: boolean): Node[] {
-    const button = (label: string, onClick: () => void, cls = '', autofocus = false) => {
-      const b = el('button', { type: 'button', class: cls }, label);
-      if (autofocus) b.setAttribute('data-autofocus', '');
-      b.addEventListener('click', onClick);
-      return b;
-    };
-
-    if (kind === 'pause') {
-      return [
-        el('div', { class: 'pause-screen' },
-          el('h2', {}, 'Pausado'),
-          el('p', { class: 'muted' }, 'Pressione Esc para voltar.'),
-          el('div', { class: 'actions' }, button('Voltar', () => this.closeDialog(), 'primary', true)),
-        ),
-      ];
-    }
-
-    if (kind === 'abandon') {
-      return [
-        el('h2', {}, 'Abandonar a partida?'),
-        el('p', {}, 'Só existe uma partida por vez. A partida atual será encerrada: os pontos entram no recorde e no histórico se forem maiores que 0, e nada mais vem dela.'),
-        el('div', { class: 'actions' },
-          button('Continuar jogando', () => this.closeDialog(), 'ghost', true),
-          button('Abandonar e começar outra', () => this.abandonAndRestart(), 'primary'),
-        ),
-      ];
-    }
-
-    if (kind === 'over') {
-      const s = this.game.summary();
-      const precision = s.precision === null ? '—' : `${Math.round(s.precision * 100)}%`;
-      const stat = (label: string, value: string) => el('div', {}, el('dt', {}, label), el('dd', {}, value));
-      const carried = BOXES.filter((b) => this.game.scripts[b]).map((b) => BOX_LABEL[b]);
-      return [
-        el('h2', {}, 'Fim de partida'),
-        el('p', { class: 'big' }, String(s.score)),
-        isRecord
-          ? el('p', { class: 'record' }, 'Novo recorde no modo fácil!')
-          : el('p', { class: 'muted' }, `Recorde: ${storage.record(this.game.mode.id)}`),
-        el('dl', { class: 'summary-grid' },
-          stat('Turnos', String(s.turns)),
-          stat('Precisão', precision),
-          stat('Acertos', String(s.totals.acertos)),
-          stat('Nível máx.', String(s.maxLevel)),
-        ),
-        el('h3', {}, 'As regras desta partida'),
-        el('ol', { class: 'regimes' }, ...s.regimes.map((r) => el('li', {}, r))),
-        carried.length ? el('p', { class: 'muted' }, `Na bagagem para a próxima partida: ${carried.join(' e ')}.`) : null,
-        el('div', { class: 'actions' }, button('Nova partida', () => this.startNewGame(), 'primary', true)),
-      ].filter((n) => n !== null);
-    }
-
-    const key = (keys: string, what: string) => [el('dt', {}, ...keys.split('+').flatMap((k, i) => (i ? ['+', el('kbd', {}, k)] : [el('kbd', {}, k)]))), el('dd', {}, what)];
-    return [
-      el('h2', {}, 'Relé — como jogar'),
-      el('ul', {},
-        el('li', {}, 'Pulsos entram pelas portas à esquerda e andam uma casa por turno. Cada um deve sair pela saída da sua cor, à direita; ruído (cinza) vai para o TERRA.'),
-        el('li', {}, 'Nas colunas de relés (◆), o pulso segue a seta do relé. Clique num relé para girá-lo (1 ação); a seta vale para todos que passarem depois.'),
-        el('li', {}, 'O Classificador decide o destino de cada pulso; o Roteador decide as setas quando há um pulso no relé. Programe os dois.'),
-        el('li', {}, 'Pulsos velados (?) escondem a cor, mas ela segue uma regra oculta que pode usar porta, carga (pontinhos), forma e o pulso anterior. Use a aba Sinais.'),
-        el('li', {}, 'Casa com pulso parado forma fila; dois pulsos entrando na mesma casa colidem (−1 de integridade cada). Use ocupado(j, DIR) no Roteador.'),
-        el('li', {}, 'Saída errada: −1. Ruído numa saída: −2. Fios rompem e saídas trocam de cor conforme o nível sobe.'),
-      ),
-      el('h3', {}, 'Atalhos'),
-      el('dl', { class: 'help-keys' },
-        ...key('Espaço', 'encerrar o turno'),
-        ...key('Tab', 'selecionar o próximo pulso'),
-        ...key('1–9, 0', 'enviar o pulso selecionado a uma saída de cor (T: terra)'),
-        ...key('S', 'segurar o pulso selecionado por 1 turno'),
-        ...key('Clique', 'girar um relé (Shift+clique ou botão direito: ao contrário)'),
-        ...key('E', 'ir para o editor'),
-        ...key('Esc', 'pausar (no editor: sair dele)'),
-        ...key('Ctrl+Enter', 'aplicar o script'),
-        ...key('Ctrl+Shift+Enter', 'testar na bancada'),
-      ),
-      el('div', { class: 'actions' }, button('Jogar', () => this.closeDialog(), 'primary', true)),
-    ];
   }
 
   // ---- Renderização ----
@@ -477,13 +715,16 @@ export class App {
 
   private refresh(): void {
     const g = this.game;
+    this.ui.mode.textContent = g.mode.label;
+    this.ui.regime.hidden = this.regimeIconTurns === 0;
+    this.ui.pp.textContent = `${storage.points(this.mode)} PP`;
     this.ui.turn.textContent = String(g.turn);
     this.ui.wave.textContent = String(g.wave);
     this.ui.waveFill.style.width = `${(g.turnInWave / g.mode.waveLength) * 100}%`;
     this.ui.waveFill.parentElement!.title = `Turno ${g.turnInWave} de ${g.mode.waveLength} da onda`;
     this.ui.level.textContent = `${g.level} ×${g.multiplier.toFixed(2)}`;
     this.ui.score.textContent = String(g.score);
-    this.ui.record.textContent = String(storage.record(g.mode.id));
+    this.ui.record.textContent = String(storage.record(this.mode));
 
     if (g.score > this.shown.score) restartAnimation(this.ui.score, 'bump');
     if (g.integrity < this.shown.integrity) restartAnimation(this.ui.integrity, 'hit');
@@ -496,13 +737,16 @@ export class App {
     this.ui.integrity.setAttribute('aria-label', `${g.integrity} de ${MAX_INTEGRITY}`);
 
     this.ui.queue.replaceChildren(
-      ...g.queue.map((q) => {
+      ...g.queue.map((q, i) => {
         const dot = el('span', { class: q.velado ? 'dot veiled' : 'dot' });
         if (!q.velado) dot.style.background = PULSE_FILL[q.cor];
         const inTurns = q.turn - g.turn;
+        const guess = i === 0 && q.previsto ? el('span', { class: 'dot guess', title: `Previsor aposta em ${COLOR_LABEL[q.previsto]}` }) : null;
+        if (guess && q.previsto) guess.style.borderColor = PULSE_FILL[q.previsto];
         return el('li', { title: q.velado ? 'velado' : COLOR_LABEL[q.cor] },
           dot,
           `#${q.seq} P${q.porta}`,
+          guess,
           el('span', { class: 'when' }, inTurns <= 0 ? 'agora' : `+${inTurns}`),
         );
       }),
@@ -511,35 +755,75 @@ export class App {
     this.ui.boardStats.textContent =
       `${g.pulses.length} na grade · portas ${p.ports} · cores ${p.palette.length} · ${g.grid.broken.size} fios rompidos`;
 
+    const auto = this.bank?.auto ?? false;
     this.ui.actions.replaceChildren(
-      ...Array.from({ length: g.mode.actionsPerTurn }, (_, i) => el('i', { class: i < g.actionsLeft ? '' : 'used' })),
+      ...Array.from({ length: g.mode.actionsPerTurn }, (_, i) => el('i', { class: i < g.actionsLeft && !auto ? '' : 'used' })),
     );
-    this.ui.energyFill.style.width = `${(g.energyLeft / g.mode.energyPerTurn) * 100}%`;
-    this.ui.energyValue.textContent = String(g.energyLeft);
-    this.ui.hold.disabled = this.selectedId === null || g.actionsLeft <= 0;
+    // A energia do Roteador é gasta no passo do mundo: o medidor mostra o último turno inteiro.
+    const used = g.lastTurnEnergy;
+    this.ui.energyFill.style.width = `${Math.min(100, (used / g.mode.energyPerTurn) * 100)}%`;
+    this.ui.energyValue.textContent = `${used}/${g.mode.energyPerTurn}`;
+    this.ui.energyMeter.title = `Energia gasta no último turno. Neste turno: ${g.energyUsed} (caixas instaladas e mem incluídos).`;
+    this.ui.energyMeter.classList.toggle('hot', used >= g.mode.energyPerTurn * 0.9);
+    this.ui.hold.disabled = this.selectedId === null || g.actionsLeft <= 0 || auto;
+    this.ui.end.disabled = auto;
+    this.ui.autoBadge.hidden = !auto;
+    this.ui.test.disabled = g.mode.bench === 'nenhuma';
+    this.ui.test.title = g.mode.bench === 'nenhuma' ? 'Não há bancada no difícil' : g.mode.bench === 'banco' ? `Ctrl+Shift+Enter · custa ${g.mode.benchCostMs / 1000} s do banco` : 'Ctrl+Shift+Enter';
+    this.ui.apply.title = g.mode.applyEndsTurn ? 'Ctrl+Enter · no difícil, aplicar custa o turno' : 'Ctrl+Enter';
 
-    this.renderScriptStatus();
+    this.renderBank();
+    this.renderBoxTabs();
     this.renderTimeline();
     this.renderLog();
     this.renderer.requestDraw();
+    this.persistSoon();
+  }
+
+  private renderBank(): void {
+    const bank = this.bank;
+    this.ui.bank.hidden = !bank;
+    if (!bank) return;
+    const seconds = Math.ceil(bank.remainingMs / 1000);
+    this.ui.bankValue.textContent = `${seconds} s`;
+    this.ui.bankFill.style.width = `${bank.fraction * 100}%`;
+    this.ui.bank.classList.toggle('low', bank.fraction < 0.25);
+  }
+
+  private renderBoxTabs(): void {
+    for (const box of BOX_IDS) {
+      const tab = byId(`box-${box}`);
+      const available = this.game.isBoxAvailable(box);
+      tab.classList.toggle('locked', !available);
+      tab.setAttribute('aria-selected', String(box === this.box));
+      tab.title = available ? BOX_HELP[box] : 'Liberado na Pesquisa';
+    }
+    this.renderScriptStatus();
+    const info = BOX_INFO[this.box];
+    this.ui.signature.replaceChildren(el('b', {}, info.signature), ` — ${BOX_HELP[this.box]}`);
   }
 
   private renderTimeline(): void {
     const g = this.game;
-    this.timeline.render(timelineItems(g), g.mode.announceRegime ? g.regimeBoundaries : [], g.activePorts);
+    this.timeline.render(timelineItems(g), g.mode.regimeNotice === 'explicito' ? g.regimeBoundaries : [], g.activePorts);
   }
 
   private renderScriptStatus(): void {
-    for (const box of BOXES) {
+    for (const box of BOX_IDS) {
       const status = byId(`status-${box}`);
+      if (!this.game.isBoxAvailable(box)) {
+        status.className = 'status';
+        status.textContent = '🔒';
+        continue;
+      }
       const script = this.game.scripts[box];
       const draft = box === this.box ? this.editor?.value : this.drafts?.[box];
       if (!script) {
         status.className = 'status';
-        status.textContent = 'inativo';
+        status.textContent = '';
       } else if (draft !== undefined && script.source !== draft) {
         status.className = 'status dirty';
-        status.textContent = `v${script.version} · não aplicado`;
+        status.textContent = `v${script.version}*`;
       } else {
         status.className = 'status live';
         status.textContent = `v${script.version}`;

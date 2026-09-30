@@ -1,7 +1,7 @@
 {
   "name": "reles",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Relé: jogo por turnos de padrões ocultos, relés e automação por scripts.",
   "type": "module",
   "engines": {

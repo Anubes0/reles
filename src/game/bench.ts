@@ -1,8 +1,18 @@
 import { COLOR_LABEL, type Color, type Dir } from '../core/colors';
 import { MAX_OPS_PER_CALL } from '../dsl/interpreter';
 import { COLS, type Grid } from './board';
-import { classify, compileFor, HIST_SIZE, route, type Decision } from './boxes';
+import { classify, compileFor, DEFAULT_CONTEXT, HIST_SIZE, route, type BoxContext, type Decision } from './boxes';
+import type { Value } from '../dsl/values';
 import type { DeliveredPulse, Destination, PulseView } from './types';
+
+/** Cópia do contexto com um `mem` próprio (listas dentro dele inclusive): o teste não altera a partida. */
+function isolated(ctx: BoxContext): BoxContext {
+  return { ...ctx, mem: ctx.mem && ctx.mem.map(copyLists) };
+}
+
+function copyLists(value: Value): Value {
+  return Array.isArray(value) ? value.map(copyLists) : value;
+}
 
 // ---- Classificador: roda contra pulsos que já saíram, com a cor revelada ----
 
@@ -27,8 +37,8 @@ export function expectedDecision(pulse: DeliveredPulse): Decision {
  * Roda o Classificador contra pulsos que já saíram. Os velados continuam velados no teste
  * e `hist` é o mesmo que o pulso teve ao entrar. Não gasta energia (modo fácil).
  */
-export function runBench(source: string, cases: DeliveredPulse[], entered: PulseView[]): BenchResult {
-  const compiled = compileFor('classificar', source);
+export function runBench(source: string, cases: DeliveredPulse[], entered: PulseView[], ctx: BoxContext = DEFAULT_CONTEXT): BenchResult {
+  const compiled = compileFor('classificar', source, ctx.features);
   if (!compiled.ok) return { ok: false, message: compiled.error.message, line: compiled.error.line };
 
   const results = cases.map((pulse): BenchCase => {
@@ -42,7 +52,7 @@ export function runBench(source: string, cases: DeliveredPulse[], entered: Pulse
       forma: pulse.forma,
     };
     const hist = entered.filter((e) => e.seq < pulse.seq).slice(-HIST_SIZE);
-    const result = classify(compiled.box, view, hist, MAX_OPS_PER_CALL);
+    const result = classify(compiled.box, view, hist, MAX_OPS_PER_CALL, isolated(ctx));
     if (!result.ok) {
       return { pulse, expected, got: null, error: `linha ${result.line}: ${result.message}`, pass: false };
     }
@@ -94,21 +104,29 @@ export function verifyRouter(
   ports: number[],
   palette: readonly Color[],
   lifetime: number,
+  ctx: BoxContext = DEFAULT_CONTEXT,
 ): RouteBenchResult {
-  const compiled = compileFor('rotear', source);
+  const compiled = compileFor('rotear', source, ctx.features);
   if (!compiled.ok) return { ok: false, message: compiled.error.message, line: compiled.error.line };
 
   const targets: Destination[] = [...palette.map((cor): Destination => ({ kind: 'saida', cor })), { kind: 'terra' }];
   const checks: RouteCheck[] = [];
   for (const porta of ports) {
     for (const target of targets) {
-      checks.push(simulate(compiled.box, grid.clone(), porta, target, lifetime));
+      checks.push(simulate(compiled.box, grid.clone(), porta, target, lifetime, isolated(ctx)));
     }
   }
   return { ok: true, checks, passed: checks.filter((c) => c.ok).length };
 }
 
-function simulate(box: Parameters<typeof route>[0], grid: Grid, porta: number, target: Destination, lifetime: number): RouteCheck {
+function simulate(
+  box: Parameters<typeof route>[0],
+  grid: Grid,
+  porta: number,
+  target: Destination,
+  lifetime: number,
+  ctx: BoxContext,
+): RouteCheck {
   const view: PulseView = {
     seq: 0,
     porta,
@@ -126,7 +144,7 @@ function simulate(box: Parameters<typeof route>[0], grid: Grid, porta: number, t
   for (let steps = 1; steps <= lifetime; steps++) {
     let stay = false;
     if (grid.isRelay(row, col)) {
-      const result = route(box, grid, row, col, view, heading, target, () => false, MAX_OPS_PER_CALL);
+      const result = route(box, grid, row, col, view, heading, target, () => false, MAX_OPS_PER_CALL, ctx);
       if (!result.ok) return fail(`erro na linha ${result.line}: ${result.message}`, steps);
       if (result.action === 'ESPERAR') {
         stay = true;

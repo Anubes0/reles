@@ -1,16 +1,33 @@
 import { COLOR_LABEL, SHAPES, type Dir, type RouteAction } from '../core/colors';
 import { Rng } from '../core/rng';
 import type { BoxDef } from '../dsl/ast';
-import type { DslError } from '../dsl/errors';
+import { DslError, type Features } from '../dsl/errors';
 import { MAX_OPS_PER_CALL } from '../dsl/interpreter';
+import type { Value } from '../dsl/values';
 import { cellKey, COLS, DEADLINE_COL, generateLayout, Grid, LAST_RELAY_COL, TERRA_ROW, type Cell } from './board';
-import { classify, compileFor, HIST_SIZE, route, type BoxId } from './boxes';
-import { FACIL, levelParams, nextLevel, type LevelParams, type ModeConfig, type WaveStats } from './mode';
+import {
+  BOX_IDS,
+  BOX_INFO,
+  classify,
+  compileFor,
+  HIST_SIZE,
+  learn,
+  MEM_SIZE,
+  predict,
+  route,
+  watch,
+  type BoxContext,
+  type BoxFailure,
+  type BoxId,
+} from './boxes';
+import { FACIL, levelParams, MODES, nextLevel, type LevelParams, type ModeConfig, type ModeId, type WaveStats } from './mode';
 import { colorFor, describeRule, generateRule, type Rule, type Traits } from './pattern';
+import { featuresFrom, type ResearchId } from './research';
 import type {
   DeliveredPulse,
   DeliveryOutcome,
   Destination,
+  EventView,
   LogEntry,
   LogKind,
   Pulse,
@@ -26,6 +43,10 @@ const DELIVERED_KEPT = 60;
 const ENTERED_KEPT = 200;
 const POINTS_DELIVERY = 10;
 const POINTS_NOISE = 5;
+/** Custo de energia, por turno, de cada posição ocupada do `mem`. */
+const MEM_COST_PER_SLOT = 2;
+/** Bônus de eficiência: até esta fração dos pontos da onda, pela energia que sobrou. */
+const EFFICIENCY_SHARE = 0.25;
 
 export interface Totals {
   acertos: number;
@@ -41,7 +62,25 @@ export interface InstalledScript {
 
 export type ActionResult = { ok: true } | { ok: false; reason: string };
 
-export const BOX_LABEL: Record<BoxId, string> = { classificar: 'Classificador', rotear: 'Roteador' };
+/** Como a partida começou. Com os comandos do diário, basta para refazê-la igual. */
+export interface MatchStart {
+  seed: number;
+  mode: ModeId;
+  baggage: Partial<Record<BoxId, string>>;
+  unlocked: ResearchId[];
+}
+
+/** Tudo o que muda uma partida por fora do gerador. Turnos seguidos viram um só comando. */
+export type Command =
+  | { c: 'destino'; id: number; dest: Destination }
+  | { c: 'segurar'; id: number }
+  | { c: 'girar'; row: number; col: number; step: 1 | -1 }
+  | { c: 'aplicar'; box: BoxId; source: string }
+  | { c: 'remover'; box: BoxId }
+  | { c: 'liberar'; id: ResearchId }
+  | { c: 'turno'; n: number };
+
+export const BOX_LABEL: Record<BoxId, string> = Object.fromEntries(BOX_IDS.map((b) => [b, BOX_INFO[b].label])) as Record<BoxId, string>;
 
 interface Move {
   pulse: Pulse;
@@ -57,6 +96,10 @@ export class Game {
   readonly mode: ModeConfig;
   readonly grid: Grid;
   private readonly rng: Rng;
+  readonly start: MatchStart;
+  /** Comandos desde o início, em ordem: é o que se salva para retomar a partida. */
+  readonly journal: Command[] = [];
+  private recording = false;
 
   turn = 1;
   level = 0;
@@ -64,6 +107,8 @@ export class Game {
   integrity = MAX_INTEGRITY;
   actionsLeft: number;
   energyUsed = 0;
+  /** Energia gasta no turno que acabou de passar (a do Roteador só aparece aí). */
+  lastTurnEnergy = 0;
   over = false;
 
   pulses: Pulse[] = [];
@@ -71,8 +116,16 @@ export class Game {
   delivered: DeliveredPulse[] = [];
   /** Tudo o que entrou, como era visível na entrada (fonte do `hist`). */
   entered: PulseView[] = [];
+  /** Últimos eventos que o Vigia recebeu (fonte do `hist` dele). */
+  events: EventView[] = [];
   log: LogEntry[] = [];
   scripts: Partial<Record<BoxId, InstalledScript>> = {};
+
+  /** Pesquisa liberada neste modo (recursos da linguagem e caixas). */
+  readonly unlocked: Set<ResearchId>;
+  features: Features;
+  /** Memória compartilhada entre as caixas; `null` até a Memória ser liberada. */
+  mem: Value[] | null = null;
 
   rule: Rule;
   readonly rulesSeen: string[] = [];
@@ -82,38 +135,108 @@ export class Game {
   lastEvents: TurnEvent[] = [];
   readonly totals: Totals = { acertos: 0, erros: 0, perdidos: 0 };
   maxLevel = 0;
+  /** Previsões feitas e acertadas pelo Previsor. */
+  predictions = { feitas: 0, acertos: 0 };
+  efficiencyPoints = 0;
 
   private regimeWavesLeft: number;
   private waveStats: WaveStats = emptyWave();
+  private wavePoints = 0;
+  private waveEfficiency = 0;
   private streak = 0;
   private nextSeq = 0;
   private nextId = 1;
   private nextGenTurn = 1;
   private lastGenerated: Traits | null = null;
-  private readonly versions: Record<BoxId, number> = { classificar: 0, rotear: 0 };
+  /** Turno da última entrega em cada linha de saída (para as saídas que apagam). */
+  private readonly seenAt = new Map<number, number>();
+  private readonly versions: Record<BoxId, number> = { classificar: 0, rotear: 0, prever: 0, vigiar: 0, aprender: 0 };
   private readonly issues = new Map<BoxId, { count: number; first: string }>();
+  private alertedThisTurn = false;
 
-  /** `baggage`: scripts trazidos da partida anterior, instalados antes do primeiro pulso entrar. */
-  constructor(seed: number, mode: ModeConfig = FACIL, baggage: Partial<Record<BoxId, string>> = {}) {
+  /**
+   * `baggage`: scripts trazidos da partida anterior, instalados antes do primeiro pulso entrar.
+   * `unlocked`: pesquisa já comprada neste modo.
+   */
+  constructor(
+    seed: number,
+    mode: ModeConfig = FACIL,
+    baggage: Partial<Record<BoxId, string>> = {},
+    unlocked: Iterable<ResearchId> = [],
+  ) {
     this.mode = mode;
     this.rng = new Rng(seed);
     this.grid = new Grid(generateLayout(this.rng));
     this.actionsLeft = mode.actionsPerTurn;
+    this.unlocked = new Set(unlocked);
+    this.start = { seed, mode: mode.id, baggage: { ...baggage }, unlocked: [...this.unlocked] };
+    this.features = featuresFrom(this.unlocked);
+    if (this.features.memoria) this.mem = Array.from({ length: MEM_SIZE }, () => null);
+    for (const o of this.grid.layout.outputs) this.seenAt.set(o.row, 1);
     this.rule = this.newRule(null);
     this.regimeWavesLeft = this.rng.int(...mode.regimeWaves);
-    for (const box of ['classificar', 'rotear'] as const) {
+    for (const box of BOX_IDS) {
       const source = baggage[box];
-      if (source) this.installScript(box, source);
+      if (source && this.isBoxAvailable(box)) this.installScript(box, source);
     }
     this.fillQueue();
     this.spawnDue();
+    this.runPredictor();
     this.flushIssues();
+    this.recording = true;
+  }
+
+  /**
+   * Refaz uma partida salva a partir do início e do diário. Retorna `null` se algum
+   * comando não se repete (uma versão nova do jogo que muda as regras, por exemplo).
+   */
+  static replay(start: MatchStart, journal: readonly Command[]): Game | null {
+    const mode = MODES[start.mode];
+    if (!mode) return null;
+    const game = new Game(start.seed, mode, start.baggage, start.unlocked);
+    for (const cmd of journal) if (!game.execute(cmd)) return null;
+    return game;
+  }
+
+  private execute(cmd: Command): boolean {
+    switch (cmd.c) {
+      case 'destino':
+        return this.assign(cmd.id, cmd.dest).ok;
+      case 'segurar':
+        return this.hold(cmd.id).ok;
+      case 'girar':
+        return this.rotateRelay(cmd.row, cmd.col, cmd.step).ok;
+      case 'aplicar':
+        return this.installScript(cmd.box, cmd.source).ok;
+      case 'remover':
+        if (!this.scripts[cmd.box]) return false;
+        this.removeScript(cmd.box);
+        return true;
+      case 'liberar':
+        this.unlock(cmd.id);
+        return true;
+      case 'turno':
+        for (let i = 0; i < cmd.n; i++) {
+          if (this.over) return false;
+          this.endTurn();
+        }
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private writeJournal(cmd: Command): void {
+    if (!this.recording) return;
+    const last = this.journal[this.journal.length - 1];
+    if (cmd.c === 'turno' && last?.c === 'turno') last.n += cmd.n;
+    else this.journal.push(cmd);
   }
 
   // ---- Leitura ----
 
   get params(): LevelParams {
-    return levelParams(this.level);
+    return levelParams(this.level, this.mode);
   }
 
   get wave(): number {
@@ -147,15 +270,48 @@ export class Game {
     return [TERRA_ROW, ...this.grid.layout.outputs.filter((o) => colors.includes(o.cor)).map((o) => o.row)];
   }
 
-  // ---- Scripts ----
+  /** Posições do `mem` ocupadas (cada uma custa energia por turno). */
+  get memUsed(): number {
+    return this.mem ? this.mem.filter((v) => v !== null).length : 0;
+  }
 
-  /** Compila e instala uma caixa. No fácil, vale a partir do próximo uso. */
+  /** A saída desta linha mostra a cor? No médio e no difícil, ela apaga sem entregas recentes. */
+  outputVisible(row: number): boolean {
+    if (row === TERRA_ROW || this.mode.outputFade === null) return true;
+    return this.turn - (this.seenAt.get(row) ?? 1) < this.mode.outputFade;
+  }
+
+  isBoxAvailable(box: BoxId): boolean {
+    const research = BOX_INFO[box].research;
+    return !research || this.unlocked.has(research);
+  }
+
+  private get ctx(): BoxContext {
+    return { features: this.features, mem: this.mem };
+  }
+
+  // ---- Pesquisa e scripts ----
+
+  /** Libera um item de pesquisa no meio da partida (a compra em si fica com a interface). */
+  unlock(id: ResearchId): void {
+    if (this.unlocked.has(id)) return;
+    this.unlocked.add(id);
+    this.features = featuresFrom(this.unlocked);
+    if (this.features.memoria && !this.mem) this.mem = Array.from({ length: MEM_SIZE }, () => null);
+    this.writeJournal({ c: 'liberar', id });
+  }
+
+  /** Compila e instala uma caixa. No fácil e no médio, vale a partir do próximo uso. */
   installScript(box: BoxId, source: string): { ok: true } | { ok: false; error: DslError } {
-    const compiled = compileFor(box, source);
+    if (!this.isBoxAvailable(box)) {
+      return { ok: false, error: new DslError(`a caixa ${BOX_LABEL[box]} ainda não foi liberada na pesquisa`, 1, 1) };
+    }
+    const compiled = compileFor(box, source, this.features);
     if (!compiled.ok) return compiled;
     this.versions[box]++;
     this.scripts[box] = { source, box: compiled.box, version: this.versions[box] };
     this.addLog('script', `${BOX_LABEL[box]} v${this.versions[box]} aplicado.`);
+    this.writeJournal({ c: 'aplicar', box, source });
     return { ok: true };
   }
 
@@ -163,6 +319,7 @@ export class Game {
     if (!this.scripts[box]) return;
     delete this.scripts[box];
     this.addLog('script', `${BOX_LABEL[box]} removido.`);
+    this.writeJournal({ c: 'remover', box });
   }
 
   // ---- Ações manuais (cada uma custa 1 ação do turno) ----
@@ -176,6 +333,7 @@ export class Game {
     pulse!.dest = dest;
     pulse!.destBy = 'manual';
     this.actionsLeft--;
+    this.writeJournal({ c: 'destino', id: pulseId, dest: { ...dest } });
     return { ok: true };
   }
 
@@ -187,6 +345,7 @@ export class Game {
     if (pulse!.held) return { ok: false, reason: 'este pulso já está segurado' };
     pulse!.held = true;
     this.actionsLeft--;
+    this.writeJournal({ c: 'segurar', id: pulseId });
     return { ok: true };
   }
 
@@ -197,6 +356,7 @@ export class Game {
     if (this.actionsLeft <= 0) return { ok: false, reason: 'sem ações neste turno: encerre o turno' };
     if (!this.grid.rotate(row, col, step)) return { ok: false, reason: 'este relé só tem uma direção possível' };
     this.actionsLeft--;
+    this.writeJournal({ c: 'girar', row, col, step });
     return { ok: true };
   }
 
@@ -212,9 +372,13 @@ export class Game {
   /** Etapa do mundo: pulsos andam, entregas e colisões são resolvidas e novos pulsos entram. */
   endTurn(): void {
     if (this.over) return;
+    this.writeJournal({ c: 'turno', n: 1 });
     this.lastEvents = [];
+    this.alertedThisTurn = false;
 
     this.stepWorld();
+    this.lastTurnEnergy = this.energyUsed;
+    this.trackEfficiency();
     if (this.over) {
       this.flushIssues();
       return;
@@ -222,10 +386,12 @@ export class Game {
 
     this.turn++;
     this.actionsLeft = this.mode.actionsPerTurn;
-    this.energyUsed = Object.keys(this.scripts).length; // custo fixo de cada chip instalado
+    // Custo fixo: cada caixa instalada e cada posição ocupada do mem.
+    this.energyUsed = Object.keys(this.scripts).length + MEM_COST_PER_SLOT * this.memUsed;
 
     if (this.turnInWave === 1) this.endWave();
     this.spawnDue();
+    this.runPredictor();
     this.flushIssues();
   }
 
@@ -346,33 +512,98 @@ export class Game {
     }
   }
 
+  // ---- Caixas: cada chamada gasta energia do turno ----
+
+  /** Quantas operações a próxima chamada pode usar; `null` se a energia acabou. */
+  private budget(box: BoxId): number | null {
+    const remaining = this.energyLeft;
+    if (remaining <= 0) {
+      this.issue(box, 'a energia do turno acabou');
+      return null;
+    }
+    return Math.min(MAX_OPS_PER_CALL, remaining);
+  }
+
+  /** Cobra a energia gasta e registra a falha, se houve. */
+  private settle<T extends { ok: true; ops: number }>(box: BoxId, limit: number, result: T | BoxFailure): result is T {
+    this.energyUsed += result.ops;
+    if (result.ok) return true;
+    const cause = result.limitHit && limit < MAX_OPS_PER_CALL ? 'a energia do turno acabou' : `linha ${result.line}: ${result.message}`;
+    this.issue(box, cause);
+    return false;
+  }
+
   private runRouter(pulse: Pulse, willBeOccupied: (self: Pulse, target: Cell) => boolean): RouteAction {
     const script = this.scripts.rotear;
     if (!script) return 'MANTER';
-    const remaining = this.energyLeft;
-    if (remaining <= 0) {
-      this.issue('rotear', 'a energia do turno acabou');
-      return 'MANTER';
-    }
+    const limit = this.budget('rotear');
+    if (limit === null) return 'MANTER';
     const { row, col } = pulse;
-    const limit = Math.min(MAX_OPS_PER_CALL, remaining);
     const occupied = (d: Dir) => {
       const target = this.grid.step(row, col, d);
       return target.col < COLS && willBeOccupied(pulse, target);
     };
-    const result = route(script.box, this.grid, row, col, viewOf(pulse), pulse.heading, pulse.dest, occupied, limit);
-    this.energyUsed += result.ops;
-    if (!result.ok) {
-      const cause = result.limitHit && limit < MAX_OPS_PER_CALL ? 'a energia do turno acabou' : `linha ${result.line}: ${result.message}`;
-      this.issue('rotear', cause);
-      return 'MANTER';
-    }
+    const result = route(script.box, this.grid, row, col, viewOf(pulse), pulse.heading, pulse.dest, occupied, limit, this.ctx);
+    if (!this.settle('rotear', limit, result)) return 'MANTER';
     const action = result.action;
     if (action !== 'ESPERAR' && action !== 'MANTER' && !this.grid.setDir(row, col, action)) {
       this.issue('rotear', `${action} bloqueado no relé da linha ${row}, coluna ${col}`);
     }
     return action;
   }
+
+  private runClassifier(pulse: Pulse, view: PulseView, hist: PulseView[]): void {
+    const script = this.scripts.classificar;
+    if (!script) return;
+    const limit = this.budget('classificar');
+    if (limit === null) return;
+    const result = classify(script.box, view, hist, limit, this.ctx);
+    if (!this.settle('classificar', limit, result)) return;
+    if (result.decision.kind === 'manual') return;
+    pulse.dest = result.decision;
+    pulse.destBy = 'script';
+  }
+
+  /** O Previsor aposta na cor do próximo pulso da fila, só com o histórico. */
+  private runPredictor(): void {
+    const script = this.scripts.prever;
+    const next = this.queue[0];
+    if (!script || !next || next.previsto !== undefined) return;
+    const limit = this.budget('prever');
+    if (limit === null) return;
+    const result = predict(script.box, this.entered.slice(-HIST_SIZE), limit, this.ctx);
+    if (!this.settle('prever', limit, result)) return;
+    next.previsto = result.cor;
+  }
+
+  /** O Vigia recebe cada evento e pode disparar um alerta (a interface pausa o jogo). */
+  private runWatcher(event: EventView): void {
+    const script = this.scripts.vigiar;
+    const hist = this.events.slice(-HIST_SIZE);
+    this.events.push(event);
+    if (this.events.length > HIST_SIZE * 3) this.events.shift();
+    if (!script) return;
+    const limit = this.budget('vigiar');
+    if (limit === null) return;
+    const result = watch(script.box, event, hist, limit, this.ctx);
+    if (!this.settle('vigiar', limit, result) || !result.alert) return;
+    const what = event.tipo === 'ENTREGA' ? (event.ok ? 'entrega certa' : 'entrega errada') : event.tipo === 'COLISAO' ? 'colisão' : 'pulso queimado';
+    const text = `Vigia: alerta no pulso #${event.pulso.seq} (${what})`;
+    this.addLog('alerta', text);
+    if (!this.alertedThisTurn) this.lastEvents.push({ kind: 'alerta', seq: event.pulso.seq, text });
+    this.alertedThisTurn = true;
+  }
+
+  /** O Aprendiz vê cada pulso que sai, com a cor revelada, e pode gravar no `mem`. */
+  private runLearner(pulse: Pulse, ok: boolean): void {
+    const script = this.scripts.aprender;
+    if (!script) return;
+    const limit = this.budget('aprender');
+    if (limit === null) return;
+    this.settle('aprender', limit, learn(script.box, revealedView(pulse), ok, limit, this.ctx));
+  }
+
+  // ---- Saídas da grade ----
 
   private deliver(pulse: Pulse, row: number): void {
     this.pulses = this.pulses.filter((p) => p !== pulse);
@@ -381,17 +612,26 @@ export class Game {
     const integrityBefore = this.integrity;
     const outcome = dest ? this.resolve(pulse, dest) : this.lostAtDeadEnd(pulse);
     this.record(pulse, dest, outcome);
-    if (dest) {
-      this.lastEvents.push({
-        kind: 'entrega',
-        seq: pulse.seq,
-        cor: pulse.cor,
-        dest,
-        outcome,
-        points: this.score - scoreBefore,
-        integrity: this.integrity - integrityBefore,
-      });
-    }
+    if (!dest) return;
+    this.seenAt.set(row, this.turn);
+    this.lastEvents.push({
+      kind: 'entrega',
+      seq: pulse.seq,
+      cor: pulse.cor,
+      dest,
+      outcome,
+      points: this.score - scoreBefore,
+      integrity: this.integrity - integrityBefore,
+    });
+    this.runLearner(pulse, outcome === 'acerto');
+    this.runWatcher({
+      tipo: 'ENTREGA',
+      pulso: revealedView(pulse),
+      ok: outcome === 'acerto',
+      saida: dest.kind === 'saida' ? dest.cor : null,
+      terra: dest.kind === 'terra',
+      destino: pulse.dest?.kind === 'saida' ? pulse.dest.cor : null,
+    });
   }
 
   private lostAtDeadEnd(pulse: Pulse): DeliveryOutcome {
@@ -406,6 +646,14 @@ export class Game {
     if (motivo === 'colisao') this.damage(1);
     else this.miss('perdidos');
     this.record(pulse, null, motivo === 'colisao' ? 'erro' : 'perdido', motivo);
+    this.runWatcher({
+      tipo: motivo === 'colisao' ? 'COLISAO' : 'QUEIMOU',
+      pulso: revealedView(pulse),
+      ok: false,
+      saida: null,
+      terra: false,
+      destino: pulse.dest?.kind === 'saida' ? pulse.dest.cor : null,
+    });
   }
 
   private record(pulse: Pulse, dest: Destination | null, outcome: DeliveryOutcome, motivo?: 'colisao' | 'queimou'): void {
@@ -426,13 +674,14 @@ export class Game {
 
   private resolve(pulse: Pulse, dest: Destination): DeliveryOutcome {
     const label = pulseLabel(pulse);
-    const mult = this.multiplier;
+    const mult = this.multiplier * (pulse.sintonizado ? 2 : 1);
+    const tuned = pulse.sintonizado ? ' (sintonizado ×2)' : '';
 
     if (dest.kind === 'terra') {
       if (pulse.cor === 'GRAY') {
         const pts = Math.round(POINTS_NOISE * mult);
         this.hit(pts);
-        this.addLog('acerto', `${label} → terra ✓ +${pts}`);
+        this.addLog('acerto', `${label} → terra ✓ +${pts}${tuned}`);
         return 'acerto';
       }
       this.miss('perdidos');
@@ -454,12 +703,13 @@ export class Game {
     }
     const pts = Math.round(POINTS_DELIVERY * mult);
     this.hit(pts);
-    this.addLog('acerto', `${label} → saída ${exit} ✓ +${pts}`);
+    this.addLog('acerto', `${label} → saída ${exit} ✓ +${pts}${tuned}`);
     return 'acerto';
   }
 
   private hit(points: number): void {
     this.score += points;
+    this.wavePoints += points;
     this.totals.acertos++;
     this.waveStats.acertos++;
     this.streak++;
@@ -481,9 +731,26 @@ export class Game {
     this.waveStats.integrityLost += amount;
   }
 
-  // ---- Ondas: diretor, grade e regime ----
+  /** Fração de energia que sobrou no turno; só conta com alguma caixa instalada. */
+  private trackEfficiency(): void {
+    if (Object.keys(this.scripts).length === 0) return;
+    this.waveEfficiency += this.energyLeft / this.mode.energyPerTurn;
+  }
+
+  // ---- Ondas: diretor, eficiência, grade e regime ----
 
   private endWave(): void {
+    const efficiency = this.waveEfficiency / this.mode.waveLength;
+    const bonus = Math.round(efficiency * this.wavePoints * EFFICIENCY_SHARE);
+    if (bonus > 0) {
+      this.score += bonus;
+      this.efficiencyPoints += bonus;
+      this.lastEvents.push({ kind: 'eficiencia', points: bonus });
+      this.addLog('info', `Eficiência da onda: +${bonus} (sobrou ${Math.round(efficiency * 100)}% da energia).`);
+    }
+    this.wavePoints = 0;
+    this.waveEfficiency = 0;
+
     const before = this.level;
     this.level = nextLevel(this.level, this.waveStats, this.mode.maxLevel);
     this.maxLevel = Math.max(this.maxLevel, this.level);
@@ -518,7 +785,7 @@ export class Game {
       this.regimeBoundaries.push(this.queue[0]?.seq ?? this.nextSeq);
       this.recolorQueue();
       this.lastEvents.push({ kind: 'regime' });
-      if (this.mode.announceRegime) this.addLog('regime', 'Mudança de regime: a regra oculta mudou!');
+      if (this.mode.regimeNotice === 'explicito') this.addLog('regime', 'Mudança de regime: a regra oculta mudou!');
     }
   }
 
@@ -529,6 +796,7 @@ export class Game {
       maxCycleLength: p.maxCycleLength,
       bases: p.bases,
       keys: p.keys,
+      minMods: p.minMods,
       maxMods: p.maxMods,
       previous,
       activePorts: this.activePorts,
@@ -578,6 +846,13 @@ export class Game {
       // Entrada ocupada (pulso segurado na porta): a fila espera.
       if (this.pulses.some((p) => p.row === row && p.col === 0)) break;
       this.queue.shift();
+      const sintonizado = q.previsto !== undefined && q.previsto !== null && q.previsto === q.cor;
+      if (q.previsto !== undefined && q.previsto !== null) {
+        this.predictions.feitas++;
+        if (sintonizado) this.predictions.acertos++;
+        this.lastEvents.push({ kind: 'previsao', seq: q.seq, acertou: sintonizado });
+        if (sintonizado) this.addLog('info', `Previsor acertou #${q.seq}: pulso sintonizado, vale o dobro.`);
+      }
       const pulse: Pulse = {
         id: this.nextId++,
         seq: q.seq,
@@ -594,6 +869,7 @@ export class Game {
         held: false,
         stalled: false,
         heading: 'LESTE',
+        sintonizado,
       };
       const view = viewOf(pulse);
       this.runClassifier(pulse, view, this.entered.slice(-HIST_SIZE));
@@ -602,27 +878,6 @@ export class Game {
       this.pulses.push(pulse);
       this.fillQueue();
     }
-  }
-
-  private runClassifier(pulse: Pulse, view: PulseView, hist: PulseView[]): void {
-    const script = this.scripts.classificar;
-    if (!script) return;
-    const remaining = this.energyLeft;
-    if (remaining <= 0) {
-      this.issue('classificar', 'a energia do turno acabou');
-      return;
-    }
-    const limit = Math.min(MAX_OPS_PER_CALL, remaining);
-    const result = classify(script.box, view, hist, limit);
-    this.energyUsed += result.ops;
-    if (!result.ok) {
-      const cause = result.limitHit && limit < MAX_OPS_PER_CALL ? 'a energia do turno acabou' : `linha ${result.line}: ${result.message}`;
-      this.issue('classificar', cause);
-      return;
-    }
-    if (result.decision.kind === 'manual') return;
-    pulse.dest = result.decision;
-    pulse.destBy = 'script';
   }
 
   // ---- Registro ----
@@ -647,7 +902,7 @@ export class Game {
     if (this.log.length > 300) this.log.shift();
   }
 
-  /** Resumo usado na tela de fim de partida. */
+  /** Resumo usado na tela de fim de partida e no histórico. */
   summary() {
     return {
       score: this.score,
@@ -657,6 +912,8 @@ export class Game {
       totals: { ...this.totals },
       maxLevel: this.maxLevel,
       regimes: [...this.rulesSeen],
+      predictions: { ...this.predictions },
+      efficiencyPoints: this.efficiencyPoints,
     };
   }
 }
@@ -670,6 +927,11 @@ export function viewOf(pulse: Pulse): PulseView {
     carga: pulse.carga,
     forma: pulse.forma,
   };
+}
+
+/** O pulso com a cor real: é assim que o Aprendiz e o Vigia o veem depois que ele sai. */
+function revealedView(pulse: Pulse): PulseView {
+  return { ...viewOf(pulse), cor: pulse.cor };
 }
 
 function traitsOf(t: Traits): Traits {

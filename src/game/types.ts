@@ -32,6 +32,8 @@ export interface Pulse {
   stalled: boolean;
   /** Direção do último movimento: o Roteador vê como `p.direcao`. */
   heading: Dir;
+  /** O Previsor acertou a cor deste pulso antes de ele entrar: vale o dobro na entrega certa. */
+  sintonizado: boolean;
 }
 
 /** Pulso ainda na fila de entrada. */
@@ -45,6 +47,8 @@ export interface QueuedPulse {
   turn: number;
   /** Ruído aleatório, fora da regra: nunca muda de cor numa troca de regime. */
   anomalia: boolean;
+  /** Cor que o Previsor apostou para este pulso (`undefined`: ainda não previu). */
+  previsto?: PulseColor | null;
 }
 
 export type DeliveryOutcome = 'acerto' | 'erro' | 'perdido';
@@ -64,7 +68,20 @@ export interface DeliveredPulse {
   motivo?: 'colisao' | 'queimou';
 }
 
-export type LogKind = 'acerto' | 'erro' | 'perdido' | 'script' | 'regime' | 'diretor' | 'grade' | 'info';
+/** O que o Vigia recebe a cada pulso que sai, colide ou queima. */
+export interface EventView {
+  tipo: 'ENTREGA' | 'COLISAO' | 'QUEIMOU';
+  /** O pulso com a cor real já revelada. */
+  pulso: PulseView;
+  ok: boolean;
+  /** Cor da saída por onde saiu (`null`: terra ou não saiu). */
+  saida: Color | null;
+  terra: boolean;
+  /** Cor do destino que o pulso tinha (`null`: sem destino ou terra). */
+  destino: Color | null;
+}
+
+export type LogKind = 'acerto' | 'erro' | 'perdido' | 'script' | 'regime' | 'diretor' | 'grade' | 'alerta' | 'info';
 
 export interface LogEntry {
   turn: number;
@@ -80,4 +97,7 @@ export type TurnEvent =
   | { kind: 'regime' }
   | { kind: 'grade'; broken: number }
   | { kind: 'deriva'; swaps: number }
-  | { kind: 'nivel'; from: number; to: number };
+  | { kind: 'nivel'; from: number; to: number }
+  | { kind: 'alerta'; seq: number; text: string }
+  | { kind: 'previsao'; seq: number; acertou: boolean }
+  | { kind: 'eficiencia'; points: number };

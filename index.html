@@ -26,8 +26,13 @@
           </svg>
           <span class="logo">RELÉ</span>
           <span class="chip" id="hud-mode">Fácil</span>
+          <span class="regime-icon" id="hud-regime" title="A regra oculta mudou" hidden>◈</span>
         </div>
         <div class="hud-stats">
+          <div class="stat bank" id="hud-bank" hidden>
+            <span class="k">Tempo <b id="hud-bank-value">60</b></span>
+            <span class="bank-bar"><span id="hud-bank-fill"></span></span>
+          </div>
           <div class="stat"><span class="k">Turno</span><span class="v" id="hud-turn">1</span></div>
           <div class="stat wave">
             <span class="k">Onda <b id="hud-wave">1</b></span>
@@ -39,6 +44,8 @@
           <div class="stat"><span class="k">Integridade</span><span class="integrity" id="hud-integrity"></span></div>
         </div>
         <div class="hud-actions">
+          <button type="button" class="ghost research-btn" id="btn-research" title="Pesquisa (P)">Pesquisa <span class="pp" id="hud-pp">0 PP</span></button>
+          <button type="button" class="ghost" id="btn-history" title="Histórico do modo">Histórico</button>
           <button type="button" class="icon" id="btn-help" title="Ajuda (H)" aria-label="Ajuda">?</button>
           <button type="button" class="ghost" id="btn-new">Nova partida</button>
         </div>
@@ -57,11 +64,12 @@
               <span class="label">Ações</span>
               <span class="pips" id="actions"></span>
             </div>
-            <div class="meter energy">
+            <div class="meter energy" id="energy-meter">
               <span class="label">Energia</span>
               <span class="bar"><span id="energy-fill"></span></span>
               <span class="value" id="energy-value">0</span>
             </div>
+            <span class="auto-badge" id="auto-badge" hidden>AUTOMÁTICO</span>
             <p class="hint" id="hint" aria-live="polite"></p>
             <button type="button" id="btn-hold" title="Segurar o pulso selecionado por 1 turno (S)">Segurar <kbd>S</kbd></button>
             <button type="button" class="primary end" id="btn-end">Encerrar turno <kbd>Espaço</kbd></button>
@@ -70,13 +78,13 @@
 
         <section class="panel code-panel" aria-label="Scripts">
           <div class="box-tabs" role="tablist" aria-label="Caixas">
-            <button type="button" role="tab" id="box-classificar" aria-selected="true">
-              Classificador <code>classificar(p, hist)</code><span class="status" id="status-classificar"></span>
-            </button>
-            <button type="button" role="tab" id="box-rotear" aria-selected="false">
-              Roteador <code>rotear(j, p, destino)</code><span class="status" id="status-rotear"></span>
-            </button>
+            <button type="button" role="tab" id="box-classificar" aria-selected="true">Classificador<span class="status" id="status-classificar"></span></button>
+            <button type="button" role="tab" id="box-rotear" aria-selected="false">Roteador<span class="status" id="status-rotear"></span></button>
+            <button type="button" role="tab" id="box-prever" aria-selected="false">Previsor<span class="status" id="status-prever"></span></button>
+            <button type="button" role="tab" id="box-vigiar" aria-selected="false">Vigia<span class="status" id="status-vigiar"></span></button>
+            <button type="button" role="tab" id="box-aprender" aria-selected="false">Aprendiz<span class="status" id="status-aprender"></span></button>
           </div>
+          <p class="box-signature" id="box-signature"></p>
           <div class="editor">
             <pre class="gutter" id="gutter" aria-hidden="true"></pre>
             <div class="code-area">
@@ -151,26 +159,33 @@
                   <li><code>ocupado(j, DIR)</code> a próxima casa vai estar ocupada?</li>
                 </ul>
                 <h3>Retornos</h3>
-                <p>Classificador: <code>saida(COR)</code> <code>TERRA</code> <code>MANUAL</code><br />Roteador: <code>NORTE</code> <code>LESTE</code> <code>SUL</code> <code>ESPERAR</code> <code>MANTER</code></p>
+                <p>Classificador: <code>saida(COR)</code> <code>TERRA</code> <code>MANUAL</code><br />Roteador: <code>NORTE</code> <code>LESTE</code> <code>SUL</code> <code>ESPERAR</code> <code>MANTER</code><br />Previsor: uma cor ou <code>None</code> · Vigia: <code>ALERTA</code> ou <code>None</code> · Aprendiz: nada</p>
+                <h3>Caixas da pesquisa</h3>
+                <ul>
+                  <li><code>prever(hist)</code> aposta na cor do próximo pulso; acertou, ele vale o dobro</li>
+                  <li><code>vigiar(evento, hist)</code> <code>evento.tipo</code> (<code>ENTREGA</code> <code>COLISAO</code> <code>QUEIMOU</code>) <code>.pulso</code> <code>.ok</code> <code>.saida</code> <code>.terra</code> <code>.destino</code></li>
+                  <li><code>ao_entregar(p, ok)</code> recebe cada pulso que sai, com a cor real</li>
+                </ul>
               </div>
               <div>
                 <h3>Sintaxe</h3>
                 <ul>
                   <li><code>if</code> <code>elif</code> <code>else</code> <code>for x in lista:</code> <code>break</code> <code>continue</code></li>
-                  <li><code>let</code> <code>const</code> <code>return</code> <code>pass</code></li>
+                  <li><code>let</code> <code>const</code> (valem no bloco) <code>return</code> <code>pass</code></li>
                   <li><code>and</code> <code>or</code> <code>not</code> <code>??</code> <code>==</code> <code>!=</code> <code>&lt;</code> <code>&gt;</code> <code>+ - * // %</code></li>
-                  <li>listas <code>[A, B]</code>, <code>l[i]</code>, <code>l[a:b]</code>, <code>len()</code>, <code>range(n)</code></li>
+                  <li>listas <code>[A, B]</code>, <code>l[i]</code>, <code>l[i] = x</code>, <code>l[a:b]</code>, <code>len()</code>, <code>range(n)</code></li>
                 </ul>
-                <h3>Regras do movimento</h3>
+                <h3>Pesquisa</h3>
                 <ul>
-                  <li>O pulso segue a seta do relé; o Roteador decide a seta quando há pulso nele.</li>
-                  <li>Mais antigos decidem primeiro. Casa com pulso parado: fila. Dois entrando na mesma casa: colisão (−1 cada). No barramento vertical, pulsos em sentidos opostos se cruzam.</li>
+                  <li>Sensores: <code>vizinhos(j)</code> (com <code>.via</code>), <code>dist(j, destino)</code></li>
+                  <li>Memória: <code>mem[0]</code> … <code>mem[7]</code>, compartilhado; 2 de energia por posição usada</li>
+                  <li>Funcional: <code>x =&gt; …</code>, <code>.filter</code> <code>.map</code> <code>.some</code> · Casamento: <code>match</code> / <code>case A, B:</code> / <code>case _:</code></li>
+                </ul>
+                <h3>Movimento e limites</h3>
+                <ul>
+                  <li>O pulso segue a seta do relé. Mais antigos decidem primeiro. Pulso parado: fila. Dois na mesma casa: colisão (−1 cada).</li>
                   <li>Sem destino na 2ª coluna de relés: terra. 60 turnos na grade: queima.</li>
-                </ul>
-                <h3>Limites</h3>
-                <ul>
-                  <li>120 operações por chamada · 1000 de energia por turno · cada caixa instalada: 1/turno</li>
-                  <li>Bloqueados: <code>=&gt;</code> 100 PP · <code>match</code> 120 PP</li>
+                  <li>120 operações por chamada · energia por turno conforme o modo · cada caixa instalada: 1/turno</li>
                 </ul>
               </div>
             </div>

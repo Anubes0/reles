@@ -106,6 +106,8 @@ export interface RuleOptions {
   maxCycleLength: number;
   bases: Base['kind'][];
   keys: Key[];
+  /** Mínimo de modificadores (o médio e o difícil já começam com regras compostas). */
+  minMods?: number;
   maxMods: number;
   previous: Rule | null;
   activePorts: number[];
@@ -117,7 +119,8 @@ export function generateRule(rng: Rng, options: RuleOptions): Rule {
   for (;;) {
     const base = generateBase(rng, options);
     const mods: Modifier[] = [];
-    const modCount = options.maxMods > 0 ? rng.int(0, options.maxMods) : 0;
+    const minMods = Math.min(options.minMods ?? 0, options.maxMods);
+    const modCount = options.maxMods > 0 ? rng.int(minMods, options.maxMods) : 0;
     for (let i = 0; i < modCount; i++) {
       const mod = generateModifier(rng, options, base, mods);
       if (mod) mods.push(mod);
@@ -147,14 +150,16 @@ function generateBase(rng: Rng, o: RuleOptions): Base {
 }
 
 function generateModifier(rng: Rng, o: RuleOptions, base: Base, mods: Modifier[]): Modifier | null {
-  if (!mods.some((m) => m.kind === 'ruido') && rng.chance(0.4)) {
+  const noise = (): Modifier => {
     const k = rng.int(4, 7);
     return { kind: 'ruido', k, r: rng.int(0, k - 1) };
-  }
+  };
+  const hasNoise = mods.some((m) => m.kind === 'ruido');
+  if (!hasNoise && rng.chance(0.4)) return noise();
   // Um modificador por atributo, e nunca sobre o atributo que já define a base.
   const baseKey = base.kind === 'ciclo' ? null : base.key;
   const keys = o.keys.filter((k) => k !== baseKey && !mods.some((m) => m.kind === 'fixa' && m.key === k));
-  if (keys.length === 0) return null;
+  if (keys.length === 0) return hasNoise ? null : noise();
   const key = rng.pick(keys);
   const values = key === 'porta' ? o.activePorts.map(String) : KEY_VALUES[key];
   return { kind: 'fixa', key, value: rng.pick(values), cor: rng.pick(o.palette) };

@@ -1,4 +1,5 @@
 import type { PulseColor, RouteAction, Shape } from '../core/colors';
+import type { Expr } from './ast';
 
 export interface ColorValue {
   t: 'cor';
@@ -32,6 +33,23 @@ export interface BuiltinValue {
   t: 'funcao';
   name: string;
 }
+/** Função anônima `x => expressão` (recurso Funcional). */
+export interface LambdaValue {
+  t: 'lambda';
+  param: string;
+  body: Expr;
+}
+/** Método de lista já ligado à lista: `hist.filter`, `hist.map`, `hist.some`. */
+export interface MethodValue {
+  t: 'metodo';
+  name: string;
+  receiver: Value[];
+}
+/** Constante sem valor numérico: tipos de evento (`ENTREGA`…) e `ALERTA`. */
+export interface SymbolValue {
+  t: 'simbolo';
+  s: string;
+}
 
 export type Value =
   | number
@@ -45,7 +63,10 @@ export type Value =
   | DirValue
   | ShapeValue
   | RecordValue
-  | BuiltinValue;
+  | BuiltinValue
+  | LambdaValue
+  | MethodValue
+  | SymbolValue;
 
 export const TERRA: TerraValue = { t: 'terra' };
 export const MANUAL: ManualValue = { t: 'manual' };
@@ -64,6 +85,10 @@ export function shape(f: Shape): ShapeValue {
 
 export function record(tipo: string, fields: Record<string, Value>): RecordValue {
   return { t: 'registro', tipo, fields };
+}
+
+export function symbol(s: string): SymbolValue {
+  return { t: 'simbolo', s };
 }
 
 export function typeName(v: Value): string {
@@ -87,7 +112,11 @@ export function typeName(v: Value): string {
     case 'registro':
       return v.tipo;
     case 'funcao':
+    case 'lambda':
+    case 'metodo':
       return 'função';
+    case 'simbolo':
+      return 'Símbolo';
   }
 }
 
@@ -116,6 +145,12 @@ export function formatValue(v: Value): string {
         .join(', ')})`;
     case 'funcao':
       return `${v.name}()`;
+    case 'lambda':
+      return `${v.param} => …`;
+    case 'metodo':
+      return `.${v.name}()`;
+    case 'simbolo':
+      return v.s;
   }
 }
 
@@ -135,11 +170,15 @@ export function valuesEqual(a: Value, b: Value): boolean {
       return a.d === (b as DirValue).d;
     case 'forma':
       return a.f === (b as ShapeValue).f;
+    case 'simbolo':
+      return a.s === (b as SymbolValue).s;
     case 'terra':
     case 'manual':
       return true;
     case 'registro':
     case 'funcao':
+    case 'lambda':
+    case 'metodo':
       return false;
   }
 }

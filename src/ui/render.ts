@@ -6,7 +6,7 @@ import { BOARD, FONT_MONO, PULSE_FILL } from './theme';
 
 const MARGIN = { left: 50, right: 128, top: 24, bottom: 10 };
 const MAX_CELL = 58;
-const MIN_CELL = 20;
+const MIN_CELL = 17;
 const TWEEN_MS = 220;
 const FLASH_MS = 750;
 const FLOAT_MS = 1000;
@@ -128,8 +128,11 @@ export class BoardRenderer {
     this.requestDraw();
   }
 
-  /** Efeitos do turno: entregas piscam, colisões explodem e mudanças ganham uma faixa. */
-  playEvents(events: TurnEvent[]): void {
+  /**
+   * Efeitos do turno: entregas piscam, colisões explodem e mudanças ganham uma faixa.
+   * `regimeBanner` é falso nos modos que não anunciam a troca de regime.
+   */
+  playEvents(events: TurnEvent[], regimeBanner = true): void {
     const at = performance.now() + (reducedMotion() ? 0 : TWEEN_MS * 0.7);
     const perRow = new Map<number, number>();
     const banners: Banner[] = [];
@@ -155,7 +158,10 @@ export class BoardRenderer {
           this.bursts.push({ row: e.row, col: e.col, color: BOARD.textMuted, start: at });
           break;
         case 'regime':
-          banners.push({ title: 'MUDANÇA DE REGIME', subtitle: 'a regra oculta mudou', color: BOARD.regime, start: at });
+          if (regimeBanner) banners.push({ title: 'MUDANÇA DE REGIME', subtitle: 'a regra oculta mudou', color: BOARD.regime, start: at });
+          break;
+        case 'alerta':
+          banners.unshift({ title: 'VIGIA: ALERTA', subtitle: e.text.replace(/^Vigia: /, ''), color: BOARD.bad, start: at });
           break;
         case 'grade':
           banners.push({
@@ -455,7 +461,9 @@ export class BoardRenderer {
       const { row, dest, key } = slot;
       const { y } = this.center(row, 0);
       const active = dest.kind === 'terra' || palette.includes(dest.cor);
-      const accent = destColor(dest);
+      // No médio e no difícil, a saída apaga sem entregas recentes: é preciso lembrar a cor.
+      const dark = active && !game.outputVisible(row);
+      const accent = dark ? BOARD.textMuted : destColor(dest);
       const top = y - h / 2;
 
       for (const f of this.flashes) {
@@ -481,7 +489,9 @@ export class BoardRenderer {
       ctx.strokeStyle = active ? accent : BOARD.inactive;
       ctx.globalAlpha = active ? 0.85 : 1;
       ctx.lineWidth = active ? 1.4 : 1;
+      if (dark) ctx.setLineDash([3, 3]);
       ctx.stroke();
+      ctx.setLineDash([]);
       ctx.globalAlpha = 1;
 
       ctx.font = `600 ${font - 1}px ${FONT_MONO}`;
@@ -503,6 +513,12 @@ export class BoardRenderer {
         ctx.moveTo(ledX - 1.2, y + 5);
         ctx.lineTo(ledX + 1.2, y + 5);
         ctx.stroke();
+      } else if (dark) {
+        ctx.beginPath();
+        ctx.arc(ledX, y, 4.5, 0, Math.PI * 2);
+        ctx.strokeStyle = BOARD.textMuted;
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
       } else {
         ctx.save();
         ctx.beginPath();
@@ -518,8 +534,8 @@ export class BoardRenderer {
 
       ctx.textAlign = 'left';
       ctx.font = `700 ${font}px ${FONT_MONO}`;
-      ctx.fillStyle = active ? BOARD.text : BOARD.inactive;
-      ctx.fillText(dest.kind === 'terra' ? 'TERRA' : dest.cor, x + 35, y + font * 0.35);
+      ctx.fillStyle = dark ? BOARD.textMuted : active ? BOARD.text : BOARD.inactive;
+      ctx.fillText(dest.kind === 'terra' ? 'TERRA' : dark ? '? ? ?' : dest.cor, x + 35, y + font * 0.35);
 
       this.outputBoxes.push({ dest, row, x, y: top, w, h });
     }

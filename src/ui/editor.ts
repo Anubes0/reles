@@ -1,4 +1,5 @@
-import { compileFor, SIGNATURES, type BoxId } from '../game/boxes';
+import { NO_FEATURES, type Features } from '../dsl/errors';
+import { compileFor, signatureFor, type BoxId } from '../game/boxes';
 import { el } from './dom';
 import {
   BUILTINS,
@@ -6,6 +7,8 @@ import {
   CONSTANTS,
   DEST_FIELDS,
   DIRECTIONS,
+  EVENT_FIELDS,
+  EVENT_WORDS,
   highlightLine,
   KEYWORDS,
   PULSE_FIELDS,
@@ -34,6 +37,17 @@ const DETAILS: Record<string, string> = {
   len: 'len(lista) → tamanho',
   range: 'range(n) → [0, …, n−1]',
   ocupado: 'ocupado(j, DIR) → a casa vai estar ocupada?',
+  vizinhos: 'vizinhos(j) → relés ao lado (com .via)',
+  dist: 'dist(j, destino) → passos até a saída',
+  via: 'direção que leva a este vizinho',
+  tipo: 'ENTREGA, COLISAO ou QUEIMOU',
+  pulso: 'o pulso, com a cor real',
+  ok: 'True se foi acerto',
+  destino: 'cor do destino que o pulso tinha',
+  mem: 'memória compartilhada: mem[0] … mem[7]',
+  ALERTA: 'pausa o jogo e avisa',
+  match: 'match valor:',
+  case: 'case A, B:',
   TERRA: 'destino: terra',
   MANUAL: 'deixa o pulso para você',
   None: 'ausência de valor',
@@ -74,6 +88,8 @@ interface Completion {
  */
 export class CodeEditor {
   box: BoxId = 'classificar';
+  /** Recursos liberados na pesquisa (valida o código e escolhe as sugestões). */
+  features: Features = NO_FEATURES;
   private validateTimer = 0;
   private error: { line: number; col: number } | null = null;
   private completions: Completion[] = [];
@@ -129,7 +145,7 @@ export class CodeEditor {
   }
 
   private validate(): void {
-    const result = compileFor(this.box, this.value);
+    const result = compileFor(this.box, this.value, this.features);
     if (result.ok) {
       this.error = null;
       this.els.message.className = 'editor-msg ok';
@@ -309,26 +325,37 @@ export class CodeEditor {
   private params(): string[] {
     const declared = /box\s+\w+\s*\(([^)]*)\)/.exec(this.value)?.[1];
     const names = declared?.split(',').map((p) => p.trim()).filter(Boolean);
-    return names?.length ? names : SIGNATURES[this.box].params;
+    return names?.length ? names : signatureFor(this.box).params;
   }
 
-  /** Campos do objeto antes do ponto: parâmetros da caixa, `hist[i]` e variáveis de laço sobre `hist`. */
+  /**
+   * Campos do objeto antes do ponto: parâmetros da caixa, itens de `hist`,
+   * `evento.pulso` e variáveis de laço sobre `hist` ou `vizinhos(j)`.
+   */
   private fieldsFor(objectText: string): string[] | null {
     const params = this.params();
     const byParam: Record<BoxId, (string[] | null)[]> = {
       classificar: [PULSE_FIELDS, null],
       rotear: [RELAY_FIELDS, [...PULSE_FIELDS, 'direcao'], DEST_FIELDS],
+      prever: [null],
+      vigiar: [EVENT_FIELDS, null],
+      aprender: [PULSE_FIELDS, null],
     };
+    const histIndex: Partial<Record<BoxId, number>> = { classificar: 1, prever: 0, vigiar: 1 };
+    const index = histIndex[this.box];
+    const hist = index !== undefined ? params[index] : null;
+    const histFields = this.box === 'vigiar' ? EVENT_FIELDS : PULSE_FIELDS;
+
+    if (this.box === 'vigiar' && /\bpulso$/.test(objectText)) return PULSE_FIELDS;
     const name = /([A-Za-z_]\w*)$/.exec(objectText)?.[1];
     if (name) {
-      const index = params.indexOf(name);
-      if (index !== -1) return byParam[this.box][index] ?? null;
-      const hist = this.box === 'classificar' ? params[1] : null;
-      if (hist && new RegExp(`for\\s+${name}\\s+in\\s+${hist}\\b`).test(this.value)) return PULSE_FIELDS;
+      const at = params.indexOf(name);
+      if (at !== -1) return byParam[this.box][at] ?? null;
+      if (hist && new RegExp(`for\\s+${name}\\s+in\\s+${hist}\\b`).test(this.value)) return histFields;
+      if (new RegExp(`for\\s+${name}\\s+in\\s+vizinhos\\b`).test(this.value)) return [...RELAY_FIELDS, 'via'];
       return null;
     }
-    const hist = this.box === 'classificar' ? params[1] : null;
-    if (hist && new RegExp(`\\b${hist}\\s*\\[[^\\]]*\\]$`).test(objectText)) return PULSE_FIELDS;
+    if (hist && new RegExp(`\\b${hist}\\s*\\[[^\\]]*\\]$`).test(objectText)) return histFields;
     return null;
   }
 
@@ -338,16 +365,27 @@ export class CodeEditor {
     for (const m of this.value.matchAll(/\b(?:let|const)\s+([A-Za-z_]\w*)/g)) declared.add(m[1]);
     for (const m of this.value.matchAll(/\bfor\s+([A-Za-z_]\w*)\s+in\b/g)) declared.add(m[1]);
 
-    const router = this.box === 'rotear';
+    const box = this.box;
+    const router = box === 'rotear';
+    const f = this.features;
     const word = (label: string, detail = DETAILS[label] ?? '') => ({ label, insert: label, detail });
-    const builtins = BUILTINS.filter((b) => (router ? b !== 'saida' : b !== 'ocupado'));
+    const builtins = BUILTINS.filter((b) => {
+      if (b === 'saida') return box === 'classificar';
+      if (b === 'ocupado') return router;
+      if (b === 'vizinhos' || b === 'dist') return router && f.sensores;
+      return true;
+    });
+    const keywords = KEYWORDS.filter((k) => (k === 'match' || k === 'case' ? f.casamento : true));
+    const constants = box === 'classificar' ? CONSTANTS : CONSTANTS.filter((c) => !['TERRA', 'MANUAL'].includes(c));
     return [
-      ...KEYWORDS.map((k) => word(k, DETAILS[k] ?? 'palavra-chave')),
+      ...keywords.map((k) => word(k, DETAILS[k] ?? 'palavra-chave')),
       ...(router ? DIRECTIONS.map((d) => word(d)) : []),
+      ...(box === 'vigiar' ? EVENT_WORDS.map((e) => word(e, DETAILS[e] ?? 'tipo de evento')) : []),
       ...COLOR_WORDS.map((c) => word(c, DETAILS[c] ?? 'cor')),
       ...SHAPE_WORDS.map((s) => word(s, 'forma')),
-      ...CONSTANTS.filter((c) => router ? !['TERRA', 'MANUAL'].includes(c) : true).map((c) => word(c, DETAILS[c] ?? 'constante')),
+      ...constants.map((c) => word(c, DETAILS[c] ?? 'constante')),
       ...builtins.map((b) => ({ label: b, insert: `${b}(`, detail: DETAILS[b] ?? '' })),
+      ...(f.memoria ? [word('mem')] : []),
       ...[...declared].map((d) => word(d, 'sua variável')),
     ];
   }

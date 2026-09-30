@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { generateLayout, Grid } from '../src/game/board';
-import { classify, compileFor, route, type BoxId } from '../src/game/boxes';
+import { classify, compileFor, learn, predict, route, watch, type BoxContext, type BoxId } from '../src/game/boxes';
+import { ALL_FEATURES } from '../src/dsl/errors';
 import type { PulseView } from '../src/game/types';
 import { Rng } from '../src/core/rng';
 
@@ -245,5 +246,148 @@ describe('DSL — compilação', () => {
   it('aceita comentários, tabs e expressões em várias linhas', () => {
     const src = 'box classificar(p, hist):  # comentário\n\tconst c = [RED,\n\t    BLUE]\n\treturn saida(c[1])';
     expect(run(src)).toMatchObject({ ok: true, decision: { kind: 'saida', cor: 'BLUE' } });
+  });
+});
+
+// ---- Recursos liberados pela pesquisa ----
+
+describe('DSL — recursos desbloqueáveis', () => {
+  const all = { features: ALL_FEATURES, mem: null };
+
+  function runWith(source: string, p: PulseView = pulse(), hist: PulseView[] = [], ctx: BoxContext = all) {
+    const compiled = compileFor('classificar', source, ctx.features);
+    if (!compiled.ok) throw new Error(`compilação falhou: ${compiled.error.message} (linha ${compiled.error.line})`);
+    return classify(compiled.box, p, hist, 120, ctx);
+  }
+
+  it('Funcional: lambdas com .filter, .map e .some', () => {
+    const src = `
+box classificar(p, hist):
+    const quadrados = hist.filter(h => h.forma == QUADRADO)
+    const portas = hist.map(h => h.porta)
+    if len(quadrados) == 2 and portas[0] == 7 and hist.some(h => h.carga == 3):
+        return TERRA
+    return MANUAL
+`;
+    const hist = [pulse({ forma: 'QUADRADO', porta: 7 }), pulse({ forma: 'QUADRADO', carga: 3 }), pulse()];
+    expect(runWith(src, pulse(), hist)).toMatchObject({ ok: true, decision: { kind: 'terra' } });
+  });
+
+  it('Funcional bloqueado: nem => nem métodos de lista', () => {
+    expect(compileFor('classificar', 'box classificar(p, hist):\n    let f = x => x\n    return TERRA').ok).toBe(false);
+    const result = run('box classificar(p, hist):\n    let l = hist.map(len)\n    return TERRA', pulse(), [pulse()]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.message).toContain('Funcional');
+  });
+
+  it('Casamento: match com vários valores por case e coringa', () => {
+    const src = `
+box classificar(p, hist):
+    match p.forma:
+        case CIRCULO, QUADRADO:
+            return saida(RED)
+        case _:
+            return saida(BLUE)
+`;
+    expect(runWith(src, pulse({ forma: 'QUADRADO' }))).toMatchObject({ decision: { kind: 'saida', cor: 'RED' } });
+    expect(runWith(src, pulse({ forma: 'TRIANGULO' }))).toMatchObject({ decision: { kind: 'saida', cor: 'BLUE' } });
+  });
+
+  it('Memória: mem é compartilhado entre chamadas e bloqueado sem pesquisa', () => {
+    const mem = Array.from({ length: 8 }, () => null) as BoxContext['mem'];
+    const ctx = { features: ALL_FEATURES, mem };
+    const src = `
+box classificar(p, hist):
+    mem[0] = (mem[0] ?? 0) + 1
+    if mem[0] == 3 and len(mem) == 8:
+        return TERRA
+    return MANUAL
+`;
+    expect(runWith(src, pulse(), [], ctx)).toMatchObject({ decision: { kind: 'manual' } });
+    expect(runWith(src, pulse(), [], ctx)).toMatchObject({ decision: { kind: 'manual' } });
+    expect(runWith(src, pulse(), [], ctx)).toMatchObject({ decision: { kind: 'terra' } });
+    expect(mem![0]).toBe(3);
+    const locked = compileFor('classificar', src);
+    expect(locked.ok).toBe(false);
+    if (!locked.ok) expect(locked.error.message).toContain('Memória');
+  });
+
+  it('atribuição por índice só em listas let', () => {
+    expect(run('box classificar(p, hist):\n    let l = [1, 2]\n    l[1] = 5\n    if l[1] == 5: return TERRA\n    return MANUAL')).toMatchObject({
+      decision: { kind: 'terra' },
+    });
+    expect(run('box classificar(p, hist):\n    const l = [1, 2]\n    l[0] = 5\n    return TERRA').ok).toBe(false);
+    expect(run('box classificar(p, hist):\n    hist[0] = 5\n    return TERRA', pulse(), [pulse()]).ok).toBe(false);
+  });
+
+  it('Sensores avançados: dist e vizinhos no Roteador, e bloqueados sem pesquisa', () => {
+    const grid = new Grid(generateLayout(new Rng(4)));
+    const dest = { kind: 'saida', cor: 'RED' } as const;
+    const row = grid.rowOf(dest) === 0 ? 5 : 0;
+    const expected = grid.distanceToExit(row, 3, grid.rowOf(dest));
+    const vias = grid.neighborRelays(row, 3).map((n) => n.via);
+    const src = `
+box rotear(j, p, destino):
+    const vs = vizinhos(j)
+    for v in vs:
+        const d = dist(v, destino)
+        if d == None:
+            return ESPERAR
+    if dist(j, destino) == ${expected} and len(vs) == ${vias.length}:
+        return vs[0].via
+    return MANTER
+`;
+    const compiled = compileFor('rotear', src, ALL_FEATURES);
+    expect(compiled.ok).toBe(true);
+    if (!compiled.ok) return;
+    const result = route(compiled.box, grid, row, 3, pulse(), 'LESTE', dest, () => false, 120, all);
+    expect(result).toMatchObject({ ok: true, action: vias[0] });
+    const locked = compileFor('rotear', src);
+    expect(locked.ok).toBe(false);
+    if (!locked.ok) expect(locked.error.message).toContain('Sensores avançados');
+  });
+
+  it('declarações valem só dentro do bloco, e cada volta do laço tem o seu', () => {
+    const src = `
+box classificar(p, hist):
+    let total = 0
+    for h in hist:
+        const c = h.carga
+        total = total + c
+    if total == 6:
+        const ok = True
+    return TERRA
+`;
+    expect(run(src, pulse(), [pulse({ carga: 1 }), pulse({ carga: 2 }), pulse({ carga: 3 })])).toMatchObject({ ok: true });
+    const leaked = run(`
+box classificar(p, hist):
+    if True:
+        const x = 1
+    if x == 1: return TERRA
+    return MANUAL
+`);
+    expect(leaked.ok).toBe(false);
+  });
+
+  it('Previsor, Vigia e Aprendiz têm assinaturas próprias', () => {
+    const prev = compileFor('prever', 'box prever(hist):\n    if len(hist) == 0: return None\n    return [RED, BLUE][(hist[-1].seq + 1) % 2]');
+    expect(prev.ok).toBe(true);
+    if (prev.ok) expect(predict(prev.box, [pulse({ seq: 4 })], 120)).toMatchObject({ ok: true, cor: 'BLUE' });
+
+    const vig = compileFor('vigiar', 'box vigiar(evento, hist):\n    if evento.tipo == COLISAO or not evento.ok: return ALERTA\n    return None');
+    expect(vig.ok).toBe(true);
+    if (vig.ok) {
+      const ev = { tipo: 'ENTREGA' as const, pulso: pulse(), ok: false, saida: 'BLUE' as const, terra: false, destino: 'RED' as const };
+      expect(watch(vig.box, ev, [], 120)).toMatchObject({ ok: true, alert: true });
+      expect(watch(vig.box, { ...ev, ok: true }, [], 120)).toMatchObject({ ok: true, alert: false });
+    }
+
+    const mem = Array.from({ length: 8 }, () => null) as BoxContext['mem'];
+    const apr = compileFor('aprender', 'box ao_entregar(p, ok):\n    if not ok: mem[p.porta] = p.cor', ALL_FEATURES);
+    expect(apr.ok).toBe(true);
+    if (apr.ok) {
+      expect(learn(apr.box, pulse({ porta: 2, cor: 'CYAN' }), false, 120, { features: ALL_FEATURES, mem })).toMatchObject({ ok: true });
+      expect(mem![2]).toEqual({ t: 'cor', c: 'CYAN' });
+    }
   });
 });
